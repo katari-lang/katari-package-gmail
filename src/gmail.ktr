@@ -56,12 +56,15 @@ data api_error(message: string)
 // once in `classify_api_error` — 401/403 is `auth_error`, everything else `api_error`.)
 type gmail_error = auth_error | api_error
 
-@"A read message trimmed to what an assistant needs: the @id@ (addresses `read_body` / `modify_labels`),
-the @thread_id@ (the conversation it belongs to), the @sender@ (the raw `From` header), the @subject@ line,
-the @snippet@ (Gmail's short plain-text preview of the message) and the @date@ (the raw `Date` header, e.g.
+@"A read message trimmed to what an assistant needs: the @id@ (the Gmail API message id — addresses
+`read_body` / `modify_labels`), the @thread_id@ (the conversation it belongs to — pass it to `send` to
+reply inside the same thread), the @message_id@ (the RFC822 `Message-ID` header, e.g.
+\"<abc@mail.gmail.com>\" — DISTINCT from @id@; pass it to `send`'s @in_reply_to@ so a reply threads in
+every mail client), the @sender@ (the raw `From` header), the @subject@ line, the @snippet@ (Gmail's short
+plain-text preview of the message) and the @date@ (the raw `Date` header, e.g.
 \"Mon, 21 Jul 2026 09:15:00 +0900\"). (The sender field is `sender`, not `from`, because `from` is a
 reserved word.)"
-data message(id: string, thread_id: string, sender: string, subject: string, snippet: string, date: string)
+data message(id: string, thread_id: string, message_id: string, sender: string, subject: string, snippet: string, date: string)
 
 // ── the provider (the credential-name capability) ────────────────────────────
 
@@ -164,15 +167,16 @@ agent header_value(headers: array[unknown], name: string) -> string {
   }
 }
 
-@"One Gmail message resource as a `message`. The From / Subject / Date come from the `payload.headers`
-array (looked up by name via `header_value`); the id, thread id and snippet come off the resource directly.
-Every read is totalized — a missing header or field degrades to the empty string, so a partial resource
-never throws into `watch`'s loop."
+@"One Gmail message resource as a `message`. The From / Subject / Date / Message-ID come from the
+`payload.headers` array (looked up by name via `header_value`); the id, thread id and snippet come off the
+resource directly. Every read is totalized — a missing header or field degrades to the empty string, so a
+partial resource never throws into `watch`'s loop."
 agent render_message(resource: unknown) -> message {
   let headers = json.items(target = json.field(target = json.field(target = resource, key = "payload"), key = "headers"))
   message(
     id = json.text(target = json.field(target = resource, key = "id")),
     thread_id = json.text(target = json.field(target = resource, key = "threadId")),
+    message_id = header_value(headers = headers, name = "Message-ID"),
     sender = header_value(headers = headers, name = "From"),
     subject = header_value(headers = headers, name = "Subject"),
     snippet = json.text(target = json.field(target = resource, key = "snippet")),
@@ -181,11 +185,11 @@ agent render_message(resource: unknown) -> message {
 }
 
 @"Fetch one message's salient fields by @id@ — a `messages.get` with `format=metadata` asking only for the
-From / Subject / Date headers, plus the snippet the resource always carries. The shared read behind
-`list_recent` and `watch`'s delivery; totalized through `render_message`."
+From / Subject / Date / Message-ID headers, plus the snippet the resource always carries. The shared read
+behind `list_recent` and `watch`'s delivery; totalized through `render_message`."
 agent get_message(id: string) -> message {
   render_message(resource = gmail_get(
-    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date",
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=Message-ID",
     context = "get_message",
   ))
 }
@@ -224,12 +228,11 @@ agent list_recent(query: string, max_results: integer ?= 10) -> array[message] {
   }
 }
 
-@"Tool: read a message's body by @id@. Returns Gmail's SNIPPET — the short plain-text preview the API
-includes on every message resource. NOTE: the full decoded plain-text body is not yet available. Gmail
-delivers a message body as base64url text (`payload.body.data`, or the text/plain part's `body.data`), and
-the standard library currently has no base64url→string decoder (only `files.from_base64`, which produces a
-`file`, and no `file`→text reader), so this tool cannot render the whole body as a string. It degrades to
-the snippet, which is total and needs no decode."
+@"Tool: read a message's plain-text body by @id@. Fetches the full message and returns its decoded
+`text/plain` body — the `payload.body.data` (or, for a `multipart/*` message, the first `text/plain`
+descendant's `body.data`) base64url-decoded to real text. A message with no plain-text part anywhere (an
+HTML-only mail) has nothing to decode, so the tool falls back to Gmail's SNIPPET — the short plain-text
+preview the API carries on every resource — which is total and always readable."
 agent read_body(id: string) -> string {
   let resource = gmail_get(
     url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full",
@@ -273,18 +276,35 @@ agent decode_plain_text(payload: unknown) -> string with pure {
 }
 
 @"Tool: send a plain-text email from the authenticated user. @to@ is the recipient address, @subject@ the
-subject line, @body@ the message body. Returns the sent message's id. The message is posted to Gmail's
-media-upload send endpoint as a raw `message/rfc822` document, which the API accepts verbatim — so no
-base64url encoding of the raw message is needed (the stdlib has no string base64url encoder; the
-media-upload path sidesteps it). Raises `gmail_error` (`auth_error` | `api_error`) on a non-2xx reply."
-agent send(to: string, subject: string, body: string) -> string {
-  // An RFC 5322 message: the To / Subject headers, a blank line, then the body. CRLF separates header lines
-  // and the header/body boundary, as the mail format requires.
-  let raw = f"To: ${to}\r\nSubject: ${subject}\r\n\r\n${body}"
+subject line, @body@ the message body. Returns the sent message's id. To REPLY inside a conversation, pass
+@thread_id@ (a message's `thread_id`, so Gmail files the reply in that thread) and @in_reply_to@ (the
+message's `message_id` — its RFC822 `Message-ID` header, read from `list_recent`); both default empty for a
+fresh send. When @in_reply_to@ is given it becomes the reply's `In-Reply-To` and `References` headers, so a
+mail client threads it too. (Compose the @subject@ yourself — prefix \"Re: \" for a reply.) The RFC822
+message is base64url-encoded into the ordinary `messages.send` `raw` field. Raises `gmail_error`
+(`auth_error` | `api_error`) on a non-2xx reply."
+agent send(to: string, subject: string, body: string, thread_id: string ?= "", in_reply_to: string ?= "") -> string {
+  // A reply carries `In-Reply-To` / `References` naming the parent's RFC822 Message-ID, so a mail client
+  // threads it (Gmail also threads server-side via `threadId` below). Empty `in_reply_to` (a fresh send)
+  // adds no such headers. Since the parent's own References chain is not exposed, `References` is just the
+  // parent — RFC 5322's accepted fallback when the ancestor chain is unknown.
+  let reply_headers = match (in_reply_to) {
+    case "" -> ""
+    case parent -> f"In-Reply-To: ${parent}\r\nReferences: ${parent}\r\n"
+  }
+  // An RFC 5322 message: the To / Subject (and any reply) headers, a blank line, then the body. CRLF
+  // separates header lines and the header/body boundary, as the mail format requires.
+  let raw = f"To: ${to}\r\nSubject: ${subject}\r\n${reply_headers}\r\n${body}"
   // The ordinary `messages.send` with the message base64url-encoded in the `raw` field — the standard
   // path, now that `string.to_base64url` exists. `http.fetch` (not `post_json`) keeps the custom
   // 401/403 → `auth_error` classification, like every other write here.
-  let payload: record[unknown] = { raw = string.to_base64url(value = raw) }
+  let base: record[unknown] = { raw = string.to_base64url(value = raw) }
+  // `threadId` files the message in an existing conversation; omitted (empty `thread_id`) it starts a new
+  // one, so an omitted arg is a smaller request rather than a blank field.
+  let payload = match (thread_id) {
+    case "" -> base
+    case conversation -> record.set(target = base, key = "threadId", value = conversation)
+  }
   let response = http.fetch(
     url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
     method = "POST",
