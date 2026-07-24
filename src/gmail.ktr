@@ -1,0 +1,405 @@
+// A self-contained Gmail tool set — pure Katari, no sidecar: every Gmail API call is `http.fetch` with the
+// request built and the reply parsed as `json` in Katari, and authentication is the runtime's credentials
+// core, reached through `oauth.token`. The tools an app hands to the model (`list_recent` / `read_body` /
+// `send` / `modify_labels`), a notification watcher (`watch`) that composes under `parallel [ … ]`, and the
+// provider that makes wiring it a one-liner: `use gmail.provider(source = credentials.oauth(name = "google"))`.
+//
+// Authentication is identical to the `google_calendar` package (a shared Google OAuth credential): the
+// provider holds NO secret and keeps NO cache. It takes a credential NAME and serves `credential` by
+// resolving that name through the runtime (`oauth.token`) — the operator registers the Google OAuth client
+// once (with a Gmail scope) and logs in through the runtime-hosted browser flow, after which the runtime
+// owns the token material end to end. The resolved access token is a `string of private` — it flows only
+// toward the `Authorization: Bearer` header and is redacted at every user-facing boundary.
+//
+// Failure has THREE meanings, each decided at its own boundary. (1) A credential that needs a HUMAN —
+// never authorized, or refresh-dead — is never an error: `oauth.token` PARKS the run on a
+// `prelude.oauth.authorize` escalation and resumes once the browser flow completes; this package neither
+// sees nor classifies that state. (2) A transient token-resolution failure (a network error, a
+// token-endpoint 5xx) is `oauth.server_error`, thrown at the provider. (3) The Gmail API's own failures are
+// this package's two-variant sum (`gmail_error = auth_error | api_error`), classified once in
+// `classify_api_error`: a 401/403 is `auth_error` (Google rejected the resolved token — a replay
+// re-resolves it, and a credential the runtime cannot refresh parks as a re-authorization prompt), every
+// other non-2xx is `api_error` (a bad request, a quota or server error — a plain backoff's case).
+//
+// The `watch` daemon is built on `time.watch` with an interval schedule, NOT a `time.sleep` recursion: a
+// per-poll recursion accumulates a durable delegation frame per tick, growing without bound over a daemon's
+// lifetime, whereas `time.watch`'s reactor owns the loop and ticks add no depth. The dedup memory — the set
+// of already-delivered message ids — rides a handler `var`, committed PER DELIVERED MESSAGE
+// (`deliver_if_new`) and pruned each tick to the ids the query still returns (`retain_window`), so the
+// memory stays bounded to one poll's result and a mid-tick failure never re-delivers a message already
+// delivered in that tick. Delivery is AT-LEAST-ONCE — exactly-once per message id only WITHIN one watch
+// activation.
+//
+// Both directions use the stdlib string codecs added for exactly this (`string.to_base64url` /
+// `string.from_base64url` / `string.url_encode`): `send` base64url-encodes the RFC822 message into the
+// ordinary `messages.send` `raw` field, `read_body` base64url-decodes the `text/plain` part's `body.data`
+// to real text (falling back to the snippet only when a message has no plain-text part), and the `q`
+// query is percent-encoded in full.
+
+@"An authentication failure: a Gmail API call came back 401/403 — Google rejected the access token the
+runtime resolved (revoked before its stored expiry, or scoped too narrowly for the call). Retrying the SAME
+token does not help, but replaying the call recovers without any app-owned escalation: catch it in a
+converter that signals `replay.interrupted` — the re-run asks `credential` afresh, the runtime refreshes the
+credential once its stored lifetime passes, and a credential the runtime cannot refresh parks the run on a
+`prelude.oauth.authorize` escalation (the admin console's re-authorization prompt) instead of failing.
+`message` carries the status and the server's body."
+data auth_error(message: string)
+
+@"A Gmail API call failed for a non-authentication reason: the endpoint returned a non-2xx status that is
+not 401/403 (a bad request, a not-found message, a quota or server error). `message` carries the status and
+the server's body so the model can read what went wrong and adjust. Distinct from `auth_error` so a program
+can tell a request the service faulted on (back off and replay as-is) from a token Google rejected (the
+replay's re-resolution is what fixes it)."
+data api_error(message: string)
+
+// A Gmail failure: an authentication failure or a plain API failure. (Type synonyms take no docs; classified
+// once in `classify_api_error` — 401/403 is `auth_error`, everything else `api_error`.)
+type gmail_error = auth_error | api_error
+
+@"A read message trimmed to what an assistant needs: the @id@ (addresses `read_body` / `modify_labels`),
+the @thread_id@ (the conversation it belongs to), the @sender@ (the raw `From` header), the @subject@ line,
+the @snippet@ (Gmail's short plain-text preview of the message) and the @date@ (the raw `Date` header, e.g.
+\"Mon, 21 Jul 2026 09:15:00 +0900\"). (The sender field is `sender`, not `from`, because `from` is a
+reserved word.)"
+data message(id: string, thread_id: string, sender: string, subject: string, snippet: string, date: string)
+
+// ── the provider (the credential-name capability) ────────────────────────────
+
+@"Get a usable Google access token, served by `provider` for the extent of a continuation — the capability
+the tools require (`with … credential`). Each ask resolves the provider's named credential through the
+runtime (`oauth.token`): the runtime returns the stored token while its recorded lifetime holds and refreshes
+it against the stored token endpoint once due, so no token bookkeeping lives in the program. The token is a
+`string of private` — it flows only toward a submission sink (the `Bearer` header). A credential that needs a
+human (never authorized, or refresh-dead) never throws: the ask PARKS the run on a `prelude.oauth.authorize`
+escalation and resumes once the browser flow completes. A transient resolution failure throws
+`oauth.server_error` at the provider."
+request credential() -> string of private
+
+// On a downstream 401/403 (an access token revoked BEFORE its stored expiry): there is no invalidation
+// channel here, and none is needed. The runtime keeps serving the stored token while its clock says valid, so
+// a mid-lifetime revocation surfaces as `auth_error` on every call for up to one access-token lifetime (≈ an
+// hour for Google) — the bounded worst case. A converter that turns `auth_error` into `replay.interrupted`
+// makes the recovery automatic: each re-run asks `credential` afresh, the resolution refreshes once the stored
+// lifetime passes, and a refresh the token endpoint refuses parks the run as a re-authorization prompt.
+@"Provide the Google credential for the extent of the continuation, from @source@ — the
+credentials-unification shape: `use gmail.provider(source = credentials.oauth(name = \"google\"))`
+(the same stored Google credential the `google_calendar` package uses, given a Gmail scope). Resolution
+happens on EVERY `credential` ask (the runtime owns the token material, its cache and its refresh, so this
+provider holds no secret and keeps no state); an unauthorized oauth credential parks the run on a
+`prelude.oauth.authorize` escalation rather than failing, and a transient resolution failure throws at the
+asking call."
+agent provider[R, effect E](
+  source: credentials.source,
+  continuation: agent (value: null) -> R with {...E, credential},
+) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
+  use handler {
+    request credential() -> string of private {
+      next credentials.resolve(source = source)
+    }
+  }
+  continuation(value = null)
+}
+
+@"The `Authorization: Bearer <token>` header every Gmail API call carries. The token is a
+`string of private` (the runtime-resolved credential); concatenation propagates the taint, and the header
+record is a private-capable submission sink, so the secret leaves only toward Google's server."
+agent bearer(token: string of private) -> record[string of private] {
+  { "Authorization" = "Bearer " ++ token }
+}
+
+@"Classify a failed Gmail API response into the error sum, at the ONE boundary where the split is decided.
+A 401 or 403 is an authentication failure — Google rejected the resolved access token (revoked, or scoped
+too narrowly) — surfaced as `auth_error`, which a replay converter turns into a fresh token resolution (and,
+when the credential is refresh-dead, the runtime's re-authorization park). Every other non-2xx is an
+`api_error`. (403 is read as auth even though Google also returns it for quota exhaustion; the
+access-rejection reading is the one worth composing the re-resolution around, and a quota 403 that is
+replayed simply fails again.) @context@ names the call for the message."
+agent classify_api_error(context: string, status: integer, body: string) -> gmail_error {
+  let status_text = string.to_string(value = status)
+  let message = f"${context} failed (status ${status_text}): ${body}"
+  match (status) {
+    case 401 -> auth_error(message = message)
+    case 403 -> auth_error(message = message)
+    case _ -> api_error(message = message)
+  }
+}
+
+// ── shared Gmail GET ─────────────────────────────────────────────────────────
+
+@"Issue an authenticated GET to a Gmail API @url@ and return its parsed JSON body — the one place the
+`Bearer` header, the 2xx check and the error classification live, shared by every read (`list_recent`,
+`read_body`, `get_message`, and `watch`'s poll). A non-2xx becomes `classify_api_error(@context@, ...)`
+(401/403 → `auth_error`, else `api_error`); @context@ names the caller for the message."
+agent gmail_get(url: string, context: string) -> unknown {
+  let response = http.fetch(
+    url = url,
+    method = "GET",
+    headers = bearer(token = credential()),
+    body = http.text(content = ""),
+  )
+  if (response.status >= 200 && response.status < 300) {
+    json.parse(text = response.body)
+  } else {
+    prelude.throw(error = classify_api_error(context = context, status = response.status, body = response.body))
+  }
+}
+
+// ── response parsing (read out of json) ──────────────────────────────────────
+
+@"The value of the first message header named @name@ (matched case-insensitively) in the @headers@ array of
+`{name, value}` objects, or the empty string when absent. Gmail returns each requested metadata header as
+such an object; this is the total lookup `render_message` reads From / Subject / Date through."
+agent header_value(headers: array[unknown], name: string) -> string {
+  let lowered = string.to_lower(value = name)
+  let matches = array.flatten(target = for (let entry in headers) {
+    next if (string.to_lower(value = json.text(target = json.field(target = entry, key = "name"))) == lowered) {
+      [json.text(target = json.field(target = entry, key = "value"))]
+    } else {
+      []
+    }
+  })
+  match (array.get(target = matches, index = 0)) {
+    case null -> ""
+    case value -> value
+  }
+}
+
+@"One Gmail message resource as a `message`. The From / Subject / Date come from the `payload.headers`
+array (looked up by name via `header_value`); the id, thread id and snippet come off the resource directly.
+Every read is totalized — a missing header or field degrades to the empty string, so a partial resource
+never throws into `watch`'s loop."
+agent render_message(resource: unknown) -> message {
+  let headers = json.items(target = json.field(target = json.field(target = resource, key = "payload"), key = "headers"))
+  message(
+    id = json.text(target = json.field(target = resource, key = "id")),
+    thread_id = json.text(target = json.field(target = resource, key = "threadId")),
+    sender = header_value(headers = headers, name = "From"),
+    subject = header_value(headers = headers, name = "Subject"),
+    snippet = json.text(target = json.field(target = resource, key = "snippet")),
+    date = header_value(headers = headers, name = "Date"),
+  )
+}
+
+@"Fetch one message's salient fields by @id@ — a `messages.get` with `format=metadata` asking only for the
+From / Subject / Date headers, plus the snippet the resource always carries. The shared read behind
+`list_recent` and `watch`'s delivery; totalized through `render_message`."
+agent get_message(id: string) -> message {
+  render_message(resource = gmail_get(
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date",
+    context = "get_message",
+  ))
+}
+
+@"Percent-encode a Gmail search @value@ for the `q` URL parameter — a full component encoder
+(`string.url_encode`), so a quoted phrase, an `&`, or any reserved character in the query rides
+intact, not just spaces."
+agent encode_query(value: string) -> string {
+  string.url_encode(value = value)
+}
+
+@"List the ids of the messages matching a Gmail search @query@, newest first, at most @max_results@ — a
+`messages.list`, which returns only `{id, threadId}` per hit (the salient fields need a `get_message` each).
+A reply without the `messages` array (no match) degrades to the empty list. Shared by `list_recent` and
+`watch`'s poll."
+agent list_message_ids(query: string, max_results: integer) -> array[string] {
+  let parsed = gmail_get(
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encode_query(value = query)}&maxResults=${string.to_string(value = max_results)}",
+    context = "list_message_ids",
+  )
+  for (let item in json.items(target = json.field(target = parsed, key = "messages"))) {
+    next json.text(target = json.field(target = item, key = "id"))
+  }
+}
+
+// ── the tools ────────────────────────────────────────────────────────────────
+
+@"Tool: list the most recent messages matching a Gmail search @query@ — the same query language as the
+Gmail search box (\"is:unread\", \"from:alice@example.com newer_than:2d\", \"subject:invoice\") — newest
+first, at most @max_results@. Each result is trimmed to id / thread / sender / subject / snippet / date, small
+enough to feed straight back to the model, and its @id@ addresses `read_body` and `modify_labels`. A message
+resource is fetched per id for its headers, so a large @max_results@ is a proportional number of calls."
+agent list_recent(query: string, max_results: integer ?= 10) -> array[message] {
+  for (let id in list_message_ids(query = query, max_results = max_results)) {
+    next get_message(id = id)
+  }
+}
+
+@"Tool: read a message's body by @id@. Returns Gmail's SNIPPET — the short plain-text preview the API
+includes on every message resource. NOTE: the full decoded plain-text body is not yet available. Gmail
+delivers a message body as base64url text (`payload.body.data`, or the text/plain part's `body.data`), and
+the standard library currently has no base64url→string decoder (only `files.from_base64`, which produces a
+`file`, and no `file`→text reader), so this tool cannot render the whole body as a string. It degrades to
+the snippet, which is total and needs no decode."
+agent read_body(id: string) -> string {
+  let resource = gmail_get(
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full",
+    context = "read_body",
+  )
+  let decoded = decode_plain_text(payload = json.field(target = resource, key = "payload"))
+  // A message with no text/plain part (an HTML-only mail, an empty walk) falls back to the snippet
+  // Gmail always carries, so the tool is total and always returns something readable.
+  if (string.is_blank(value = decoded)) {
+    json.text(target = json.field(target = resource, key = "snippet"))
+  } else {
+    decoded
+  }
+}
+
+@"The decoded text/plain body of a Gmail @payload@ — its `body.data` (base64url) decoded when the
+part is `text/plain`, otherwise the first `text/plain` descendant found by walking `parts` (a
+`multipart/*` message). Total: no text/plain part anywhere returns the empty string. Internal to
+`read_body`."
+agent decode_plain_text(payload: unknown) -> string with pure {
+  match (json.field(target = payload, key = "mimeType")) {
+    case string(mime_type) -> {
+      if (mime_type == "text/plain") {
+        string.from_base64url(value = json.text(target = json.field(target = json.field(target = payload, key = "body"), key = "data")))
+      } else {
+        // A multipart (or any container) message: walk the parts and take the first plain-text body.
+        let found = for (let part in json.items(target = json.field(target = payload, key = "parts"))) {
+          next decode_plain_text(payload = part)
+        }
+        let non_empty = array.flatten(target = for (let text in found) {
+          next if (string.is_blank(value = text)) { [] } else { [text] }
+        })
+        match (array.get(target = non_empty, index = 0)) {
+          case null -> ""
+          case first -> first
+        }
+      }
+    }
+    case _ -> ""
+  }
+}
+
+@"Tool: send a plain-text email from the authenticated user. @to@ is the recipient address, @subject@ the
+subject line, @body@ the message body. Returns the sent message's id. The message is posted to Gmail's
+media-upload send endpoint as a raw `message/rfc822` document, which the API accepts verbatim — so no
+base64url encoding of the raw message is needed (the stdlib has no string base64url encoder; the
+media-upload path sidesteps it). Raises `gmail_error` (`auth_error` | `api_error`) on a non-2xx reply."
+agent send(to: string, subject: string, body: string) -> string {
+  // An RFC 5322 message: the To / Subject headers, a blank line, then the body. CRLF separates header lines
+  // and the header/body boundary, as the mail format requires.
+  let raw = f"To: ${to}\r\nSubject: ${subject}\r\n\r\n${body}"
+  // The ordinary `messages.send` with the message base64url-encoded in the `raw` field — the standard
+  // path, now that `string.to_base64url` exists. `http.fetch` (not `post_json`) keeps the custom
+  // 401/403 → `auth_error` classification, like every other write here.
+  let payload: record[unknown] = { raw = string.to_base64url(value = raw) }
+  let response = http.fetch(
+    url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+    method = "POST",
+    headers = bearer(token = credential()),
+    body = http.json(value = payload),
+  )
+  if (response.status >= 200 && response.status < 300) {
+    json.text(target = json.field(target = json.parse(text = response.body), key = "id"))
+  } else {
+    prelude.throw(error = classify_api_error(context = "send", status = response.status, body = response.body))
+  }
+}
+
+@"Tool: change a message's labels — add the label ids in @add@, remove those in @remove@. The common use is
+marking a message read by removing \"UNREAD\", or filing it by adding a label id. Both lists default to empty
+(an empty call is a no-op at the API). @id@ is the message id. Returns null; raises `gmail_error`
+(`auth_error` | `api_error`) on a non-2xx reply."
+agent modify_labels(id: string, add: array[string] ?= [], remove: array[string] ?= []) -> null {
+  let payload: record[unknown] = { addLabelIds = add, removeLabelIds = remove }
+  // `http.json` serialises the value tree and defaults the application/json Content-Type; the custom
+  // 401/403 → `auth_error` classification is why this keeps `http.fetch` rather than `post_json`.
+  let response = http.fetch(
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}/modify",
+    method = "POST",
+    headers = bearer(token = credential()),
+    body = http.json(value = payload),
+  )
+  if (response.status >= 200 && response.status < 300) {
+    null
+  } else {
+    prelude.throw(error = classify_api_error(context = "modify_labels", status = response.status, body = response.body))
+  }
+}
+
+// ── the watch daemon ─────────────────────────────────────────────────────────
+
+@"Deliver one message and record its id the INSTANT its `deliver_to` returns — the per-message dedup
+commit. Handled inside `watch`; the id is looked up in the durable `already_notified` var (absent → fetch
+the message, deliver, and append; present → skip), so a mid-tick failure never re-delivers a message already
+delivered in the same tick. The message resource is fetched lazily HERE (only for a new id), so a poll that
+finds nothing new issues no per-message reads. Internal to `watch`; an app does not handle it."
+request deliver_if_new(id: string) -> null
+
+@"Prune the dedup memory to @keys@ — the ids the query returned this poll — dropping messages that have
+left the result set (read, aged out of a `newer_than:` window, or fallen past the poll cap), so the memory
+stays bounded to one poll. Performed once per tick before delivery. Internal to `watch`; an app does not
+handle it."
+request retain_window(keys: array[string]) -> null
+
+@"Watch the mailbox for messages matching a Gmail search @query@ and deliver each NEW one, once per
+activation, to @deliver_to@ — shaped like `time.watch` / `discord.watch_messages` so it composes under
+`parallel [ … ]`. Every @poll_interval_milliseconds@ it lists the most recent messages matching @query@
+(e.g. \"is:unread\" or \"newer_than:1d\") and calls @deliver_to@ for each id not yet notified. @deliver_to@'s
+effects @E@ flow to the caller's handlers unchanged, so a delivery may itself call other tools (reply,
+label). `watch` never resolves (`-> never`); it runs until the run is cancelled.
+
+Delivery is AT-LEAST-ONCE, exactly-once per message id only WITHIN a single activation: a message that keeps
+matching @query@ is delivered a single time while the watch keeps running. A crash-recovery restart resumes
+the durable dedup memory and does not re-notify; but a replay re-run (a `replay.forever` / `replay.exponential`
+around the watch re-invokes its continuation, giving a fresh activation whose memory starts empty)
+re-delivers every message still matching, and a `deliver_to` failure re-delivers the messages after it in
+that tick on the next run. The dedup memory is pruned each tick to the ids the query still returns, so a
+message that leaves the result set (it was read, or aged out of a `newer_than:` window) drops from memory —
+and if it re-enters the result later it re-notifies. The poll returns the most recent matches up to an
+internal cap, so a burst of more new matches than the cap between two polls delays the oldest until they
+re-surface within the cap.
+
+No retry is built in — a poll failure (an http error, a rejected token, a `deliver_to` that throws)
+propagates and kills the watch, exactly as an uncaught failure in any callee does. Compose resilience by
+wrapping the watch in a replay provider (`replay.forever` with a converter that replays the transient blips
+AND `auth_error` — the re-run re-resolves the token, and a credential needing a human parks on the runtime's
+authorize escalation rather than failing). The first poll is one @poll_interval@ in (a `time.watch`
+occurrence fires one interval after the start)."
+agent watch[effect E](
+  query: string,
+  poll_interval_milliseconds: number,
+  deliver_to: agent (message: message) -> null with E,
+) -> never with E | io | credential | prelude.throw[gmail_error | http.fetch_error | json.parse_error] {
+  // The dedup memory is a handler `var` (durable across a restart). `retain_window` prunes it to the ids the
+  // query still returns each tick and `deliver_if_new` advances it once per delivered message, so
+  // `time.watch` owns the loop and the memory — not a growing recursion — is the only state carried between
+  // polls.
+  use handler (var already_notified: array[string] = []) {
+    request retain_window(keys: array[string]) {
+      // Keep only the ids still in this poll's result; a message that has left it drops out, bounding the
+      // memory to one poll's size.
+      let retained = array.flatten(target = for (let key in already_notified) {
+        next if (array.contains(target = keys, value = key)) { [key] } else { [] }
+      })
+      next null with { already_notified = retained }
+    }
+    request deliver_if_new(id: string) {
+      // The dedup key is the message id (stable and globally unique in the mailbox). The message is fetched
+      // and delivered only for an unseen id, and the commit happens AFTER `deliver_to` returns, so a throw
+      // leaves the id unmarked and the message is retried on a later run.
+      match (array.index_of(target = already_notified, value = id)) {
+        case null -> {
+          deliver_to(message = get_message(id = id))
+          next null with { already_notified = array.append(target = already_notified, value = id) }
+        }
+        case _ -> { next null }
+      }
+    }
+  }
+  // The `time.watch` deliver_to: list this tick's matches, reconcile the dedup memory to them, then deliver
+  // the unseen messages one at a time. A local agent because it captures `query`; its `retain_window` /
+  // `deliver_if_new` are handled by the var above, its `credential` / throws flow out to the caller. The
+  // occurrence's scheduled instant (`time`) is unused — this watch selects by query, not by a time window.
+  agent poll_on_tick(time: number) -> null with credential | io | retain_window | deliver_if_new | prelude.throw[gmail_error | http.fetch_error | json.parse_error] {
+    // Cap the poll at a bounded window of recent matches; the dedup memory is pruned to exactly this set, so
+    // the cap is also the memory bound.
+    let ids = list_message_ids(query = query, max_results = 50)
+    retain_window(keys = ids)
+    for (let id in ids) { deliver_if_new(id = id) }
+    null
+  }
+  time.watch(schedule = time.interval(milliseconds = poll_interval_milliseconds), deliver_to = poll_on_tick)
+}
