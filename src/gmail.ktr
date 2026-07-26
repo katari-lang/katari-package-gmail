@@ -458,10 +458,10 @@ agent attachment_content_type(id: string, attachment_id: string) -> string {
 @"Tool: fetch ONE of a message's attachments and return it as a file. @id@ is the MESSAGE's id (a
 `list_recent` result's @id@ — not its @message_id@) and @attachment_id@ is the @attachment_id@ of one entry
 in that message's @attachments@ list. The result is a `file` handle: the bytes stay runtime-side, so the
-handle can be passed straight on to another tool that takes a file — give it to the image viewer
-(`ai.view_image`) to LOOK at a photo, a screenshot or a scanned invoice — while the payload itself never
-enters the conversation. The file records the content type the mail declared for that part, which is what
-makes an image viewable. This only READS: nothing in the mailbox changes, and one call fetches one
+handle can be passed straight on to any other tool you hold that takes a file — an image viewer, to LOOK
+at a photo, a screenshot or a scanned invoice — while the payload itself never enters the conversation.
+The file records the content type the mail declared for that part, which is what lets a viewer recognise
+an image as one. This only READS: nothing in the mailbox changes, and one call fetches one
 attachment, so ask for the one you actually need. A payload that comes back corrupt throws
 `files.malformed_base64` rather than handing back broken bytes; a non-2xx reply raises `gmail_error`
 (`auth_error` | `api_error`)."
@@ -586,8 +586,8 @@ agent list_all_message_ids(query: string, page_token: string | null, accumulated
 }
 
 @"Watch the mailbox for mail that ARRIVES matching a Gmail search @query@ and deliver each new message
-once, oldest first, to @deliver_to@ — shaped like `time.watch` / `discord.watch_messages` so it composes
-under `parallel [ … ]`. The watch takes a cursor at the moment it starts, and every
+once, oldest first, to @deliver_to@ — shaped like the stdlib's `time.watch`, so it composes under
+`parallel [ … ]` beside any other daemon. The watch takes a cursor at the moment it starts, and every
 @poll_interval_milliseconds@ it searches `<@query@> after:<cursor>` (@query@ is the ordinary Gmail search
 language — \"is:unread\", \"from:alice@example.com\"), calls @deliver_to@ for each message it finds, and
 moves the cursor to that message's own arrival instant (Gmail's `internalDate`). @deliver_to@'s effects @E@
