@@ -23,12 +23,16 @@
 //
 // The `watch` daemon is built on `time.watch` with an interval schedule, NOT a `time.sleep` recursion: a
 // per-poll recursion accumulates a durable delegation frame per tick, growing without bound over a daemon's
-// lifetime, whereas `time.watch`'s reactor owns the loop and ticks add no depth. The dedup memory — the set
-// of already-delivered message ids — rides a handler `var`, committed PER DELIVERED MESSAGE
-// (`deliver_if_new`) and pruned each tick to the ids the query still returns (`retain_window`), so the
-// memory stays bounded to one poll's result and a mid-tick failure never re-delivers a message already
-// delivered in that tick. Delivery is AT-LEAST-ONCE — exactly-once per message id only WITHIN one watch
-// activation.
+// lifetime, whereas `time.watch`'s reactor owns the loop and ticks add no depth. What it carries between
+// ticks is a WATERMARK, not a set of seen ids: the watch primes a cursor at the instant it starts and each
+// tick searches `<query> after:<cursor>`, so the mail already sitting in the mailbox is never "new" (the
+// backlog is below the cursor) and a message that leaves the result set and re-enters it never comes back
+// (the cursor has passed it). The cursor advances by the DELIVERED messages' own `internalDate` — Gmail's
+// receive clock — never by the poller's, so a slow tick, a long turn or a skewed clock cannot step over
+// mail; the poller's clock enters once, to cap how far one tick may carry the cursor, which can only hold
+// it back. Its only companion memory is the handful of ids delivered at the cursor's own second, which is
+// what makes the second-granular `after:` boundary safe in either direction. Delivery is AT-LEAST-ONCE: a crash
+// between one message's delivery and its commit re-delivers that message, nothing else.
 //
 // Both directions use the stdlib string codecs added for exactly this (`string.to_base64url` /
 // `string.from_base64url` / `string.url_encode`): `send` base64url-encodes the RFC822 message into the
@@ -184,14 +188,41 @@ agent render_message(resource: unknown) -> message {
   )
 }
 
-@"Fetch one message's salient fields by @id@ — a `messages.get` with `format=metadata` asking only for the
-From / Subject / Date / Message-ID headers, plus the snippet the resource always carries. The shared read
-behind `list_recent` and `watch`'s delivery; totalized through `render_message`."
-agent get_message(id: string) -> message {
-  render_message(resource = gmail_get(
+@"Fetch one message's metadata RESOURCE by @id@ — a `messages.get` with `format=metadata` asking only for
+the From / Subject / Date / Message-ID headers; the snippet and `internalDate` ride every resource whatever
+the format. The shared read behind `get_message` and `watch`, which needs the same reply's `internalDate`
+for its watermark and so reads the resource rather than the rendered `message`."
+agent get_message_resource(id: string) -> unknown {
+  gmail_get(
     url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=Message-ID",
     context = "get_message",
-  ))
+  )
+}
+
+@"Fetch one message's salient fields by @id@ — `get_message_resource` rendered through `render_message`,
+so a missing header degrades to the empty string rather than throwing. `list_recent`'s per-id read."
+agent get_message(id: string) -> message {
+  render_message(resource = get_message_resource(id = id))
+}
+
+@"The epoch SECOND of a message resource's `internalDate` — the instant GMAIL received the message, which
+the API carries as a string of epoch milliseconds — or `null` when the field is absent or unreadable.
+`watch`'s cursor is the maximum of these over the messages it has delivered, so the cursor tracks Google's
+own receive clock instead of the poller's: nothing arriving between a tick's listing and its deliveries can
+be stepped over."
+agent internal_date_seconds(resource: unknown) -> integer | null {
+  // Google renders int64 fields as JSON STRINGS, so `internalDate` arrives as "1753500000000" — but the
+  // bare-number shape is read too, because a cursor that silently stopped advancing on a shape change would
+  // turn the watch mute rather than loud, the hardest failure to notice.
+  let milliseconds = match (json.field(target = resource, key = "internalDate")) {
+    case string(text) -> string.to_integer(value = text)
+    case integer(value) -> value
+    case _ -> null
+  }
+  match (milliseconds) {
+    case null -> null
+    case parsed -> math.floor(value = parsed / 1000)
+  }
 }
 
 @"Percent-encode a Gmail search @value@ for the `q` URL parameter — a full component encoder
@@ -201,18 +232,34 @@ agent encode_query(value: string) -> string {
   string.url_encode(value = value)
 }
 
-@"List the ids of the messages matching a Gmail search @query@, newest first, at most @max_results@ — a
-`messages.list`, which returns only `{id, threadId}` per hit (the salient fields need a `get_message` each).
-A reply without the `messages` array (no match) degrades to the empty list. Shared by `list_recent` and
-`watch`'s poll."
-agent list_message_ids(query: string, max_results: integer) -> array[string] {
-  let parsed = gmail_get(
-    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encode_query(value = query)}&maxResults=${string.to_string(value = max_results)}",
-    context = "list_message_ids",
-  )
+@"The `messages.list` URL for a Gmail search @query@ asking for at most @max_results@ ids, continuing from
+@page_token@ when one is given (`null` asks for the first page). The one place the search endpoint's shape
+lives, shared by `list_recent`'s single page and `watch`'s full drain."
+agent list_url(query: string, max_results: integer, page_token: string | null) -> string {
+  let base = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encode_query(value = query)}&maxResults=${string.to_string(value = max_results)}"
+  match (page_token) {
+    case null -> base
+    case token -> base ++ "&pageToken=" ++ token
+  }
+}
+
+@"The message ids on one `messages.list` page, in the order Gmail returned them (newest first) — the reply
+carries only `{id, threadId}` per hit, so the salient fields need a `get_message` each. A page without the
+`messages` array (no match) degrades to the empty list."
+agent page_message_ids(parsed: unknown) -> array[string] {
   for (let item in json.items(target = json.field(target = parsed, key = "messages"))) {
     next json.text(target = json.field(target = item, key = "id"))
   }
+}
+
+@"List the ids of the messages matching a Gmail search @query@, newest first, at most @max_results@ — one
+`messages.list` page. `list_recent`'s listing; `watch` drains every page instead, because a cursor may only
+pass mail that has actually been seen."
+agent list_message_ids(query: string, max_results: integer) -> array[string] {
+  page_message_ids(parsed = gmail_get(
+    url = list_url(query = query, max_results = max_results, page_token = null),
+    context = "list_message_ids",
+  ))
 }
 
 // ── the tools ────────────────────────────────────────────────────────────────
@@ -341,84 +388,150 @@ agent modify_labels(id: string, add: array[string] ?= [], remove: array[string] 
 
 // ── the watch daemon ─────────────────────────────────────────────────────────
 
-@"Deliver one message and record its id the INSTANT its `deliver_to` returns — the per-message dedup
-commit. Handled inside `watch`; the id is looked up in the durable `already_notified` var (absent → fetch
-the message, deliver, and append; present → skip), so a mid-tick failure never re-delivers a message already
-delivered in the same tick. The message resource is fetched lazily HERE (only for a new id), so a poll that
-finds nothing new issues no per-message reads. Internal to `watch`; an app does not handle it."
-request deliver_if_new(id: string) -> null
+@"One delivered message's boundary mark: its @id@ and the epoch @second@ of the `internalDate` it was
+delivered for. `watch` keeps only the marks at or above its current query floor — the mail of one or two
+seconds, normally none at all — so the memory is CONSTANT rather than the delivered history it used to be.
+Internal to `watch`; an app never builds one."
+data delivered_mark(id: string, second: integer)
 
-@"Prune the dedup memory to @keys@ — the ids the query returned this poll — dropping messages that have
-left the result set (read, aged out of a `newer_than:` window, or fallen past the poll cap), so the memory
-stays bounded to one poll. Performed once per tick before delivery. Internal to `watch`; an app does not
-handle it."
-request retain_window(keys: array[string]) -> null
+@"The epoch second this tick hands to its `after:` term: one second BELOW the watermark, so the listing
+covers the watermark's own second whichever way Gmail reads the boundary. Handled inside `watch`; an app
+does not handle it."
+request query_floor() -> integer
 
-@"Watch the mailbox for messages matching a Gmail search @query@ and deliver each NEW one, once per
-activation, to @deliver_to@ — shaped like `time.watch` / `discord.watch_messages` so it composes under
-`parallel [ … ]`. Every @poll_interval_milliseconds@ it lists the most recent messages matching @query@
-(e.g. \"is:unread\" or \"newer_than:1d\") and calls @deliver_to@ for each id not yet notified. @deliver_to@'s
-effects @E@ flow to the caller's handlers unchanged, so a delivery may itself call other tools (reply,
-label). `watch` never resolves (`-> never`); it runs until the run is cancelled.
+@"Deliver one message and move the watermark to its arrival instant the INSTANT its `deliver_to` returns —
+the per-message commit. Handled inside `watch`: an id already marked at the query floor is skipped,
+otherwise the message resource is fetched HERE (only for an unseen id, so a tick that finds nothing new
+issues no per-message read), delivered, and the cursor advances. @tick_second@ is the epoch second of the
+polling tick — the cursor may not pass it. Internal to `watch`; an app does not handle it."
+request deliver_if_new(id: string, tick_second: integer) -> null
 
-Delivery is AT-LEAST-ONCE, exactly-once per message id only WITHIN a single activation: a message that keeps
-matching @query@ is delivered a single time while the watch keeps running. A crash-recovery restart resumes
-the durable dedup memory and does not re-notify; but a replay re-run (a `replay.forever` / `replay.exponential`
-around the watch re-invokes its continuation, giving a fresh activation whose memory starts empty)
-re-delivers every message still matching, and a `deliver_to` failure re-delivers the messages after it in
-that tick on the next run. The dedup memory is pruned each tick to the ids the query still returns, so a
-message that leaves the result set (it was read, or aged out of a `newer_than:` window) drops from memory —
-and if it re-enters the result later it re-notifies. The poll returns the most recent matches up to an
-internal cap, so a burst of more new matches than the cap between two polls delays the oldest until they
-re-surface within the cap.
+@"Every message id matching @query@, across ALL result pages, OLDEST FIRST — `watch`'s per-poll listing.
+@page_token@ is `null` for the first page and @accumulated@ the ids gathered so far. Draining every page
+is what makes a cursor safe: Gmail lists matches NEWEST first and offers no ascending order, so a listing
+cut off at a cap would hand back the newest matches only, and a cursor advanced over them would strand the
+older ones below it forever. The recursion depth is the number of pages in ONE poll (500 matches a page —
+a poll's arrivals, not the mailbox), not the daemon's lifetime, so it does not accumulate like a per-tick
+loop would. Internal to `watch`."
+agent list_all_message_ids(query: string, page_token: string | null, accumulated: array[string]) -> array[string] with credential | io | prelude.throw[gmail_error | http.fetch_error | json.parse_error] {
+  let parsed = gmail_get(url = list_url(query = query, max_results = 500, page_token = page_token), context = "watch")
+  let combined = array.concat(left = accumulated, right = page_message_ids(parsed = parsed))
+  match (json.field(target = parsed, key = "nextPageToken")) {
+    case string(token) -> list_all_message_ids(query = query, page_token = token, accumulated = combined)
+    // The pages arrive newest-first, and delivery must run oldest-first: the cursor then only ever passes
+    // mail that has actually been delivered, so a `deliver_to` that throws mid-tick leaves the rest of the
+    // tick still ABOVE the cursor and the next tick lists them again.
+    case _ -> array.reverse(target = combined)
+  }
+}
+
+@"Watch the mailbox for mail that ARRIVES matching a Gmail search @query@ and deliver each new message
+once, oldest first, to @deliver_to@ — shaped like `time.watch` / `discord.watch_messages` so it composes
+under `parallel [ … ]`. The watch takes a cursor at the moment it starts, and every
+@poll_interval_milliseconds@ it searches `<@query@> after:<cursor>` (@query@ is the ordinary Gmail search
+language — \"is:unread\", \"from:alice@example.com\"), calls @deliver_to@ for each message it finds, and
+moves the cursor to that message's own arrival instant (Gmail's `internalDate`). @deliver_to@'s effects @E@
+flow to the caller's handlers unchanged, so a delivery may itself call other tools (reply, label). `watch`
+never resolves (`-> never`); it runs until the run is cancelled.
+
+WHAT IT REPORTS IS ARRIVAL, NOT MATCHING. The mail already in the mailbox when the watch starts is never
+delivered, however well it matches: a watch started on \"is:unread\" over 200 unread messages stays silent
+until the next mail arrives. By the same token, mail that comes to match @query@ LATER — an old message you
+star, label or mark unread — is not delivered either, because the search never looks below the cursor. This
+is the right shape for hearing about incoming mail, and the wrong one for a general \"tell me whenever
+anything matches this search\" trigger. (The cursor's granularity is one second — Gmail's `after:` takes
+whole seconds — so mail that arrived in the very second the watch started may still come through.)
+
+Delivery is AT-LEAST-ONCE. The cursor is durable, so a crash-recovery restart resumes where it stood, at
+worst re-delivering the one message whose `deliver_to` had returned without its commit landing. A replay
+re-run is different: a `replay.forever` / `replay.exponential` around the watch re-invokes its continuation,
+and the fresh activation takes a FRESH cursor at that moment — mail that arrived while the failed
+activation was down is skipped rather than replayed at you. Within one activation a tick drains every page
+of its listing, so a watch whose runtime was stopped for a while catches up on the whole backlog that
+arrived meanwhile, oldest first.
 
 No retry is built in — a poll failure (an http error, a rejected token, a `deliver_to` that throws)
 propagates and kills the watch, exactly as an uncaught failure in any callee does. Compose resilience by
 wrapping the watch in a replay provider (`replay.forever` with a converter that replays the transient blips
 AND `auth_error` — the re-run re-resolves the token, and a credential needing a human parks on the runtime's
-authorize escalation rather than failing). The first poll is one @poll_interval@ in (a `time.watch`
-occurrence fires one interval after the start)."
+authorize escalation rather than failing). The first poll is one @poll_interval_milliseconds@ in (a
+`time.watch` occurrence fires one interval after the start), so a message arriving just after the watch
+starts waits up to one interval — it is not lost, only pending."
 agent watch[effect E](
   query: string,
   poll_interval_milliseconds: number,
   deliver_to: agent (message: message) -> null with E,
 ) -> never with E | io | credential | prelude.throw[gmail_error | http.fetch_error | json.parse_error] {
-  // The dedup memory is a handler `var` (durable across a restart). `retain_window` prunes it to the ids the
-  // query still returns each tick and `deliver_if_new` advances it once per delivered message, so
-  // `time.watch` owns the loop and the memory — not a growing recursion — is the only state carried between
-  // polls.
-  use handler (var already_notified: array[string] = []) {
-    request retain_window(keys: array[string]) {
-      // Keep only the ids still in this poll's result; a message that has left it drops out, bounding the
-      // memory to one poll's size.
-      let retained = array.flatten(target = for (let key in already_notified) {
-        next if (array.contains(target = keys, value = key)) { [key] } else { [] }
-      })
-      next null with { already_notified = retained }
+  // The cursor is PRIMED HERE, at the watch's first instant, in a handler `var` (durable across a restart):
+  // everything already in the mailbox sits below it, so the watch starts silent and reports arrivals only.
+  // This `time.now()` is the daemon's ONE read of the poller's clock, and the only one that is safe — it
+  // decides where "already there" ends and nothing more; every later move of the cursor comes from Gmail's
+  // own receive clock, so no amount of skew or delay can step the cursor over unseen mail.
+  use handler (
+    var watermark_seconds: integer = math.floor(value = time.now() / 1000),
+    var boundary: array[delivered_mark] = [],
+  ) {
+    request query_floor() {
+      // One second BELOW the cursor. Gmail's `after:` takes an epoch second, but whether it means "> that
+      // second" or ">= that second" is not documented — listing from a second below makes BOTH readings
+      // return every message at the cursor's own second, so nothing arriving in that second can fall
+      // between two polls. The overlap this buys is exactly what `boundary` covers, so it costs no
+      // duplicates: `boundary` holds every id already delivered at or above this floor.
+      next watermark_seconds - 1
     }
-    request deliver_if_new(id: string) {
-      // The dedup key is the message id (stable and globally unique in the mailbox). The message is fetched
-      // and delivered only for an unseen id, and the commit happens AFTER `deliver_to` returns, so a throw
-      // leaves the id unmarked and the message is retried on a later run.
-      match (array.index_of(target = already_notified, value = id)) {
+    request deliver_if_new(id: string, tick_second: integer) {
+      let marked = for (let mark in boundary) { next mark.id }
+      match (array.index_of(target = marked, value = id)) {
         case null -> {
-          deliver_to(message = get_message(id = id))
-          next null with { already_notified = array.append(target = already_notified, value = id) }
+          let resource = get_message_resource(id = id)
+          // An unreadable `internalDate` is read AS the cursor's own second: its mark then survives the
+          // pruning below (so the message is not delivered again) while the cursor stays put (so no other
+          // mail is skipped) — the two failure modes that reading it as 0, or as "now", would each cause.
+          let second = match (internal_date_seconds(resource = resource)) {
+            case null -> watermark_seconds
+            case parsed -> parsed
+          }
+          deliver_to(message = render_message(resource = resource))
+          // The commit lands only AFTER `deliver_to` returns, so a throw leaves the cursor where it was and
+          // the message is listed again on the next run. The cursor only ever moves FORWARD (a listing is
+          // ordered by Gmail's relevance-ish recency, not exactly by `internalDate`), and the marks that
+          // fall below the new floor are dropped: mail that far back can no longer be listed at all, so
+          // its mark has nothing left to prevent. That is what keeps this memory constant.
+          //
+          // It never moves past the tick that observed it, either. `internalDate` drives every advance —
+          // the poller's clock must not, or a slow turn would step over mail — but a message dated in the
+          // FUTURE (an import carrying its own Date header) would otherwise park the cursor there and mute
+          // the watch until that date arrived. Capping the ADVANCE can only hold the cursor BACK, which
+          // costs a re-listing that the marks absorb; the MARK keeps the message's true second, so a
+          // future-dated message stays remembered for as long as the cursor sits below it and is never
+          // delivered twice.
+          let advanced = math.max(left = watermark_seconds, right = math.min(left = second, right = tick_second))
+          let kept = array.flatten(target = for (let mark in boundary) {
+            next if (mark.second >= advanced - 1) { [mark] } else { [] }
+          })
+          next null with {
+            watermark_seconds = advanced,
+            boundary = array.append(target = kept, value = delivered_mark(id = id, second = second)),
+          }
         }
         case _ -> { next null }
       }
     }
   }
-  // The `time.watch` deliver_to: list this tick's matches, reconcile the dedup memory to them, then deliver
-  // the unseen messages one at a time. A local agent because it captures `query`; its `retain_window` /
-  // `deliver_if_new` are handled by the var above, its `credential` / throws flow out to the caller. The
-  // occurrence's scheduled instant (`time`) is unused — this watch selects by query, not by a time window.
-  agent poll_on_tick(time: number) -> null with credential | io | retain_window | deliver_if_new | prelude.throw[gmail_error | http.fetch_error | json.parse_error] {
-    // Cap the poll at a bounded window of recent matches; the dedup memory is pruned to exactly this set, so
-    // the cap is also the memory bound.
-    let ids = list_message_ids(query = query, max_results = 50)
-    retain_window(keys = ids)
-    for (let id in ids) { deliver_if_new(id = id) }
+  // The `time.watch` deliver_to: list everything that arrived past the cursor, oldest first, and deliver it
+  // one message at a time. A local agent because it captures `query`; its `query_floor` / `deliver_if_new`
+  // are handled by the var above, its `credential` / throws flow out to the caller. The occurrence's
+  // scheduled instant (`time`) does not decide what is new — the cursor does — it only caps how far the
+  // cursor may travel in this tick.
+  agent poll_on_tick(time: number) -> null with credential | io | query_floor | deliver_if_new | prelude.throw[gmail_error | http.fetch_error | json.parse_error] {
+    // The caller's query AND the cursor: Gmail ANDs the terms, so the search sees only mail that arrived
+    // past the floor. A caller's own `after:` / `newer_than:` term simply narrows it further.
+    let floor_seconds = query_floor()
+    let arrivals = f"${query} after:${string.to_string(value = floor_seconds)}"
+    let tick_second = math.floor(value = time / 1000)
+    for (let id in list_all_message_ids(query = arrivals, page_token = null, accumulated = [])) {
+      deliver_if_new(id = id, tick_second = tick_second)
+    }
     null
   }
   time.watch(schedule = time.interval(milliseconds = poll_interval_milliseconds), deliver_to = poll_on_tick)
