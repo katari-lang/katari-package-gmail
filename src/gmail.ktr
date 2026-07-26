@@ -261,7 +261,16 @@ agent get_message_resource(id: string, context: string) -> unknown {
   // headers and NOTHING of the payload's part tree, and the part tree is the only place an attachment is
   // described. Read as metadata, every message's `attachments` would come back empty however many files
   // the mail carried — a quiet lie about the mail rather than an error, which is the failure worth paying
-  // to avoid. The price is a larger reply per message (the text bodies come along), not a larger program.
+  // to avoid.
+  //
+  // What that costs is BOUNDED, which matters because `watch` runs this per new message on every poll: a
+  // part's bytes and its `attachmentId` are mutually exclusive in the API's own contract — "when present,
+  // [attachmentId] contains the ID of an external attachment that can be retrieved in a separate
+  // messages.attachments.get request; when not present, the entire content of the message part body is
+  // contained in the data field". So an attachment's bytes NEVER ride this reply; a 10 MB PDF costs its
+  // one part-tree entry per read and nothing more, and only `fetch_attachment` ever moves it. The price
+  // is the message's own TEXT bodies coming along beside the headers — a bigger reply per message, not a
+  // download per poll.
   gmail_get(
     url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full",
     context = context,
