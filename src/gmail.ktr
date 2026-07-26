@@ -1,8 +1,9 @@
 // A self-contained Gmail tool set — pure Katari, no sidecar: every Gmail API call is `http.fetch` with the
 // request built and the reply parsed as `json` in Katari, and authentication is the runtime's credentials
 // core, reached through `oauth.token`. The tools an app hands to the model (`list_recent` / `read_body` /
-// `send` / `modify_labels`), a notification watcher (`watch`) that composes under `parallel [ … ]`, and the
-// provider that makes wiring it a one-liner: `use gmail.provider(source = credentials.oauth(name = "google"))`.
+// `fetch_attachment` / `send` / `modify_labels`), a notification watcher (`watch`) that composes under
+// `parallel [ … ]`, and the provider that makes wiring it a one-liner:
+// `use gmail.provider(source = credentials.oauth(name = "google"))`.
 //
 // Authentication is identical to the `google_calendar` package (a shared Google OAuth credential): the
 // provider holds NO secret and keeps NO cache. It takes a credential NAME and serves `credential` by
@@ -36,9 +37,12 @@
 //
 // Both directions use the stdlib string codecs added for exactly this (`string.to_base64url` /
 // `string.from_base64url` / `string.url_encode`): `send` base64url-encodes the RFC822 message into the
-// ordinary `messages.send` `raw` field, `read_body` base64url-decodes the `text/plain` part's `body.data`
-// to real text (falling back to the snippet only when a message has no plain-text part), and the `q`
-// query is percent-encoded in full.
+// ordinary `messages.send` `raw` field, `read_body` base64url-decodes the wanted part's `body.data` to
+// real text (the `text/plain` part, else the `text/html` part's markup, else the snippet), and the `q`
+// query is percent-encoded in full. An ATTACHMENT is bytes rather than text and so takes the other road:
+// `fetch_attachment` hands its base64url payload to `files.from_base64` (through `base64url_to_base64`,
+// because the blob producer takes the standard alphabet) and returns a `file`, so the bytes go to the
+// project's blob store and only the slim handle rides the value plane.
 
 @"An authentication failure: a Gmail API call came back 401/403 — Google rejected the access token the
 runtime resolved (revoked before its stored expiry, or scoped too narrowly for the call). Retrying the SAME
@@ -60,15 +64,27 @@ data api_error(message: string)
 // once in `classify_api_error` — 401/403 is `auth_error`, everything else `api_error`.)
 type gmail_error = auth_error | api_error
 
+@"One attachment a message carries, as Gmail describes it: the @filename@ the sender gave it (\"\" when it
+has none, which an inline image often does), the @content_type@ the mail declares for it (e.g.
+\"application/pdf\", \"image/png\"), the @size@ in bytes Gmail estimates for it, and the @attachment_id@
+that `fetch_attachment` fetches it by — together with the MESSAGE's id, since an attachment id names a
+part of one particular message. Plain data: knowing an attachment exists is one thing, and asking for its
+bytes is another (`fetch_attachment`), so a mail can be read and judged without downloading anything.
+Every part whose bytes Gmail holds behind an `attachmentId` is listed, which puts a mail's INLINE images
+(the logo in an HTML signature) in the list beside its real files — the mail declares no difference
+between them, so the list reports what is there and leaves what is worth fetching to its reader."
+data attachment(filename: string, content_type: string, size: integer, attachment_id: string)
+
 @"A read message trimmed to what an assistant needs: the @id@ (the Gmail API message id — addresses
-`read_body` / `modify_labels`), the @thread_id@ (the conversation it belongs to — pass it to `send` to
-reply inside the same thread), the @message_id@ (the RFC822 `Message-ID` header, e.g.
+`read_body` / `modify_labels` / `fetch_attachment`), the @thread_id@ (the conversation it belongs to —
+pass it to `send` to reply inside the same thread), the @message_id@ (the RFC822 `Message-ID` header, e.g.
 \"<abc@mail.gmail.com>\" — DISTINCT from @id@; pass it to `send`'s @in_reply_to@ so a reply threads in
 every mail client), the @sender@ (the raw `From` header), the @subject@ line, the @snippet@ (Gmail's short
-plain-text preview of the message) and the @date@ (the raw `Date` header, e.g.
-\"Mon, 21 Jul 2026 09:15:00 +0900\"). (The sender field is `sender`, not `from`, because `from` is a
-reserved word.)"
-data message(id: string, thread_id: string, message_id: string, sender: string, subject: string, snippet: string, date: string)
+plain-text preview of the message), the @date@ (the raw `Date` header, e.g.
+\"Mon, 21 Jul 2026 09:15:00 +0900\") and the @attachments@ (one `attachment` entry per attached part,
+empty for a mail with none — each entry's @attachment_id@, with this message's @id@, is what
+`fetch_attachment` takes). (The sender field is `sender`, not `from`, because `from` is a reserved word.)"
+data message(id: string, thread_id: string, message_id: string, sender: string, subject: string, snippet: string, date: string, attachments: array[attachment])
 
 // ── the provider (the credential-name capability) ────────────────────────────
 
@@ -171,12 +187,46 @@ agent header_value(headers: array[unknown], name: string) -> string {
   }
 }
 
+@"Every attachment Gmail reports under a @payload@, walking `parts` to any depth — a `multipart/mixed`
+message keeps its files next to a nested `multipart/alternative` text, and a forwarded mail nests deeper
+still. The test is the one the API itself makes: a part whose `body.attachmentId` is present is a part
+whose bytes Gmail is holding for a separate fetch, so it is listed, while a part carrying inline
+`body.data` (the text of the mail) is not. Total — a payload with neither an attachment id nor parts
+yields the empty list. Internal to `render_message` and `fetch_attachment`."
+agent collect_attachments(payload: unknown) -> array[attachment] with pure {
+  let body = json.field(target = payload, key = "body")
+  // A size Gmail did not report reads as 0 rather than failing the message: the size only informs a
+  // reader's judgement about whether to fetch, whereas the id is what fetching actually needs.
+  let size_bytes = match (json.field(target = body, key = "size")) {
+    case integer(bytes) -> bytes
+    case _ -> 0
+  }
+  let own = match (json.field(target = body, key = "attachmentId")) {
+    case string(attachment_id) -> [
+      attachment(
+        filename = json.text(target = json.field(target = payload, key = "filename")),
+        content_type = json.text(target = json.field(target = payload, key = "mimeType")),
+        size = size_bytes,
+        attachment_id = attachment_id,
+      ),
+    ]
+    case _ -> []
+  }
+  let nested = array.flatten(target = for (let part in json.items(target = json.field(target = payload, key = "parts"))) {
+    next collect_attachments(payload = part)
+  })
+  array.concat(left = own, right = nested)
+}
+
 @"One Gmail message resource as a `message`. The From / Subject / Date / Message-ID come from the
 `payload.headers` array (looked up by name via `header_value`); the id, thread id and snippet come off the
-resource directly. Every read is totalized — a missing header or field degrades to the empty string, so a
-partial resource never throws into `watch`'s loop."
+resource directly; the attachments come from the same payload's part tree (`collect_attachments`), which
+is why `get_message_resource` reads the FULL format. Every read is totalized — a missing header or field
+degrades to the empty string and a missing part tree to no attachments — so a partial resource never
+throws into `watch`'s loop."
 agent render_message(resource: unknown) -> message {
-  let headers = json.items(target = json.field(target = json.field(target = resource, key = "payload"), key = "headers"))
+  let payload = json.field(target = resource, key = "payload")
+  let headers = json.items(target = json.field(target = payload, key = "headers"))
   message(
     id = json.text(target = json.field(target = resource, key = "id")),
     thread_id = json.text(target = json.field(target = resource, key = "threadId")),
@@ -185,24 +235,32 @@ agent render_message(resource: unknown) -> message {
     subject = header_value(headers = headers, name = "Subject"),
     snippet = json.text(target = json.field(target = resource, key = "snippet")),
     date = header_value(headers = headers, name = "Date"),
+    attachments = collect_attachments(payload = payload),
   )
 }
 
-@"Fetch one message's metadata RESOURCE by @id@ — a `messages.get` with `format=metadata` asking only for
-the From / Subject / Date / Message-ID headers; the snippet and `internalDate` ride every resource whatever
-the format. The shared read behind `get_message` and `watch`, which needs the same reply's `internalDate`
-for its watermark and so reads the resource rather than the rendered `message`."
-agent get_message_resource(id: string) -> unknown {
+@"Fetch one message's RESOURCE by @id@ — a `messages.get` with `format=full`; the headers
+(From / Subject / Date / Message-ID), the snippet, the `internalDate` and the payload's part tree all ride
+that one reply. The ONE place the per-message endpoint's shape lives, shared by `get_message`, `read_body`,
+`fetch_attachment`'s content-type lookup and `watch` — which needs the same reply's `internalDate` for its
+watermark and so reads the resource rather than the rendered `message`. @context@ names the calling tool
+for a failure's message."
+agent get_message_resource(id: string, context: string) -> unknown {
+  // FULL, not `metadata`: the metadata format answers with the message-level fields and the requested
+  // headers and NOTHING of the payload's part tree, and the part tree is the only place an attachment is
+  // described. Read as metadata, every message's `attachments` would come back empty however many files
+  // the mail carried — a quiet lie about the mail rather than an error, which is the failure worth paying
+  // to avoid. The price is a larger reply per message (the text bodies come along), not a larger program.
   gmail_get(
-    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=Message-ID",
-    context = "get_message",
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full",
+    context = context,
   )
 }
 
 @"Fetch one message's salient fields by @id@ — `get_message_resource` rendered through `render_message`,
 so a missing header degrades to the empty string rather than throwing. `list_recent`'s per-id read."
 agent get_message(id: string) -> message {
-  render_message(resource = get_message_resource(id = id))
+  render_message(resource = get_message_resource(id = id, context = "get_message"))
 }
 
 @"The epoch SECOND of a message resource's `internalDate` — the instant GMAIL received the message, which
@@ -275,39 +333,51 @@ agent list_recent(query: string, max_results: integer ?= 10) -> array[message] {
   }
 }
 
-@"Tool: read a message's plain-text body by @id@. Fetches the full message and returns its decoded
-`text/plain` body — the `payload.body.data` (or, for a `multipart/*` message, the first `text/plain`
-descendant's `body.data`) base64url-decoded to real text. A message with no plain-text part anywhere (an
-HTML-only mail) has nothing to decode, so the tool falls back to Gmail's SNIPPET — the short plain-text
-preview the API carries on every resource — which is total and always readable."
+@"Tool: read a message's text body by @id@. Fetches the full message and returns its decoded body,
+preferring the `text/plain` part — the `payload.body.data` (or, for a `multipart/*` message, the first
+`text/plain` descendant's `body.data`) base64url-decoded to real text. A message with no plain-text part
+anywhere (an HTML-only mail — a newsletter, a receipt, most mail a company sends) returns its `text/html`
+part's MARKUP instead, prefixed with one line saying so: the markup is the whole substance of such a mail
+and reads perfectly well, whereas returning nothing would report a full message as blank. Expect tags, and
+expect a long HTML mail to be a long result. A message with neither part falls back to Gmail's SNIPPET —
+the short plain-text preview the API carries on every resource — so the tool always returns something
+readable. ATTACHMENTS are not part of the body: they are listed on the `message` (`list_recent`) and
+fetched by `fetch_attachment`."
 agent read_body(id: string) -> string {
-  let resource = gmail_get(
-    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full",
-    context = "read_body",
-  )
-  let decoded = decode_plain_text(payload = json.field(target = resource, key = "payload"))
-  // A message with no text/plain part (an HTML-only mail, an empty walk) falls back to the snippet
-  // Gmail always carries, so the tool is total and always returns something readable.
-  if (string.is_blank(value = decoded)) {
-    json.text(target = json.field(target = resource, key = "snippet"))
+  let resource = get_message_resource(id = id, context = "read_body")
+  let payload = json.field(target = resource, key = "payload")
+  let plain = decode_part_text(payload = payload, mime_type = "text/plain")
+  if (string.is_blank(value = plain)) {
+    let markup = decode_part_text(payload = payload, mime_type = "text/html")
+    // WHY the markup rather than the snippet: an HTML-only mail keeps its entire content in the
+    // `text/html` part, and a model reads HTML as well as it reads prose — so answering "what did that
+    // newsletter say" with two lines of preview, or with nothing, is wrong in the quiet way that looks
+    // like an empty mail. The one-line prefix is what makes the fallback VISIBLE: a reader, model or
+    // program, can tell markup from prose without inspecting the text for tags.
+    if (string.is_blank(value = markup)) {
+      json.text(target = json.field(target = resource, key = "snippet"))
+    } else {
+      f"[no text/plain part — the message's text/html markup follows]\n${markup}"
+    }
   } else {
-    decoded
+    plain
   }
 }
 
-@"The decoded text/plain body of a Gmail @payload@ — its `body.data` (base64url) decoded when the
-part is `text/plain`, otherwise the first `text/plain` descendant found by walking `parts` (a
-`multipart/*` message). Total: no text/plain part anywhere returns the empty string. Internal to
-`read_body`."
-agent decode_plain_text(payload: unknown) -> string with pure {
+@"The decoded text of the first @mime_type@ part under a Gmail @payload@ — its `body.data` (base64url)
+decoded when the payload IS that type, otherwise the first such descendant found by walking `parts` (a
+`multipart/*` message). The wanted type is an ARGUMENT rather than a second walk, so the preference order
+lives in one place (`read_body`: plain, then html) and this stays a plain search. Total: no such part
+anywhere returns the empty string. Internal to `read_body`."
+agent decode_part_text(payload: unknown, mime_type: string) -> string with pure {
   match (json.field(target = payload, key = "mimeType")) {
-    case string(mime_type) -> {
-      if (mime_type == "text/plain") {
+    case string(part_mime_type) -> {
+      if (part_mime_type == mime_type) {
         string.from_base64url(value = json.text(target = json.field(target = json.field(target = payload, key = "body"), key = "data")))
       } else {
-        // A multipart (or any container) message: walk the parts and take the first plain-text body.
+        // A multipart (or any container) message: walk the parts and take the first body of the wanted type.
         let found = for (let part in json.items(target = json.field(target = payload, key = "parts"))) {
-          next decode_plain_text(payload = part)
+          next decode_part_text(payload = part, mime_type = mime_type)
         }
         let non_empty = array.flatten(target = for (let text in found) {
           next if (string.is_blank(value = text)) { [] } else { [text] }
@@ -320,6 +390,74 @@ agent decode_plain_text(payload: unknown) -> string with pure {
     }
     case _ -> ""
   }
+}
+
+@"Translate a base64url payload (the `-_` alphabet, padding often omitted) into the STANDARD base64
+(`+/`, padded to a multiple of four) that `files.from_base64` takes. Gmail hands back every `data` field in
+the url alphabet, while the blob producer validates the standard one strictly and refuses anything else
+with `files.malformed_base64`, so this translation is what lets an attachment's bytes land intact instead
+of being rejected. It is deliberately NOT `string.from_base64url`: that decodes to TEXT, and decoding a
+PDF's or an image's bytes as UTF-8 mangles them in a way nothing downstream can detect — the silent
+corruption this exists to avoid. Internal to `fetch_attachment`."
+agent base64url_to_base64(value: string) -> string with pure {
+  let translated = string.replace(
+    value = string.replace(value = value, search = "-", replacement = "+"),
+    search = "_",
+    replacement = "/",
+  )
+  // Restore the `=` padding base64url drops, because the strict decoder requires a length that is a
+  // multiple of four. A remainder of 1 is not a base64 length at all (a truncated payload) and is left
+  // alone on purpose: it then reaches the decoder and fails loudly as `files.malformed_base64` rather than
+  // being padded into some other, wrong set of bytes.
+  match (string.length(value = translated) % 4) {
+    case 2 -> translated ++ "=="
+    case 3 -> translated ++ "="
+    case _ -> translated
+  }
+}
+
+@"The content type the MESSAGE declares for the attachment @attachment_id@ names on message @id@, or \"\"
+when that message reports no such attachment. The `attachments.get` reply carries the bytes and a size and
+no MIME type at all, and a `file` recording no type cannot be SHOWN to a model as an image (an image is
+inlined on its recorded `image/*` type), so `fetch_attachment` spends one message read to record the type
+the mail itself declared. The lookup runs over the same `attachment` list a `message` carries — data
+already derived, not a second parse of the payload. Internal to `fetch_attachment`."
+agent attachment_content_type(id: string, attachment_id: string) -> string {
+  let payload = json.field(target = get_message_resource(id = id, context = "fetch_attachment"), key = "payload")
+  let declared = array.flatten(target = for (let entry in collect_attachments(payload = payload)) {
+    next if (entry.attachment_id == attachment_id) { [entry.content_type] } else { [] }
+  })
+  match (array.get(target = declared, index = 0)) {
+    case null -> ""
+    case found -> found
+  }
+}
+
+@"Tool: fetch ONE of a message's attachments and return it as a file. @id@ is the MESSAGE's id (a
+`list_recent` result's @id@ — not its @message_id@) and @attachment_id@ is the @attachment_id@ of one entry
+in that message's @attachments@ list. The result is a `file` handle: the bytes stay runtime-side, so the
+handle can be passed straight on to another tool that takes a file — give it to the image viewer
+(`ai.view_image`) to LOOK at a photo, a screenshot or a scanned invoice — while the payload itself never
+enters the conversation. The file records the content type the mail declared for that part, which is what
+makes an image viewable. This only READS: nothing in the mailbox changes, and one call fetches one
+attachment, so ask for the one you actually need. A payload that comes back corrupt throws
+`files.malformed_base64` rather than handing back broken bytes; a non-2xx reply raises `gmail_error`
+(`auth_error` | `api_error`)."
+agent fetch_attachment(id: string, attachment_id: string) -> file {
+  // The declared type first, off the message: the attachment endpoint answers with the bytes and a size
+  // only, so the message's own part is the sole place a MIME type can come from.
+  let content_type = attachment_content_type(id = id, attachment_id = attachment_id)
+  let resource = gmail_get(
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}/attachments/${attachment_id}",
+    context = "fetch_attachment",
+  )
+  // `files.from_base64` PRODUCES a blob: the bytes go to the project's blob store and the value plane
+  // carries the slim handle alone, so a 5 MB attachment never rides a durable call record, a trace or a
+  // model's context. That is the whole reason a `file` — not a base64 string — is the right return here.
+  files.from_base64(
+    content = base64url_to_base64(value = json.text(target = json.field(target = resource, key = "data"))),
+    content_type = content_type,
+  )
 }
 
 @"Tool: send a plain-text email from the authenticated user. @to@ is the recipient address, @subject@ the
@@ -483,7 +621,7 @@ agent watch[effect E](
       let marked = for (let mark in boundary) { next mark.id }
       match (array.index_of(target = marked, value = id)) {
         case null -> {
-          let resource = get_message_resource(id = id)
+          let resource = get_message_resource(id = id, context = "watch")
           // An unreadable `internalDate` is read AS the cursor's own second: its mark then survives the
           // pruning below (so the message is not delivered again) while the cursor stays put (so no other
           // mail is skipped) — the two failure modes that reading it as 0, or as "now", would each cause.
