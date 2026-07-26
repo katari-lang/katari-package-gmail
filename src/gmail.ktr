@@ -38,8 +38,9 @@
 // Both directions use the stdlib string codecs added for exactly this (`string.to_base64url` /
 // `string.from_base64url` / `string.url_encode`): `send` base64url-encodes the RFC822 message into the
 // ordinary `messages.send` `raw` field, `read_body` base64url-decodes the wanted part's `body.data` to
-// real text (the `text/plain` part, else the `text/html` part's markup, else the snippet), and the `q`
-// query is percent-encoded in full. An ATTACHMENT is bytes rather than text and so takes the other road:
+// real text (the `text/plain` part, else the `text/html` part's markup, else the snippet — and it returns
+// WHICH one it got as a `message_body`'s content type, so rendering the difference is the app's business
+// and not this package's), and the `q` query is percent-encoded in full. An ATTACHMENT is bytes rather than text and so takes the other road:
 // `fetch_attachment` hands its base64url payload to `files.from_base64` (through `base64url_to_base64`,
 // because the blob producer takes the standard alphabet) and returns a `file`, so the bytes go to the
 // project's blob store and only the slim handle rides the value plane.
@@ -74,6 +75,16 @@ Every part whose bytes Gmail holds behind an `attachmentId` is listed, which put
 (the logo in an HTML signature) in the list beside its real files — the mail declares no difference
 between them, so the list reports what is there and leaves what is worth fetching to its reader."
 data attachment(filename: string, content_type: string, size: integer, attachment_id: string)
+
+@"A message's body as read: the @text@ itself, and the @content_type@ of the part that text came from —
+\"text/plain\" for an ordinary mail, \"text/html\" when the message had no plain-text part (@text@ is then
+MARKUP, tags and all), or \"\" when it had neither and @text@ is Gmail's short SNIPPET preview rather than
+a body at all. The type is a FIELD, not a sentence prefixed to the text: an announcement written into the
+prose would fix one consumer's presentation inside this package, where nobody can inspect or override it
+and every other consumer has to parse it back out — a reader that wants to strip the tags, or render the
+markup, or ignore the distinction entirely needs the type as data. (\"\" for \"none\" is the convention
+`files.content_type` and `header_value` already use here.)"
+data message_body(content_type: string, text: string)
 
 @"A read message trimmed to what an assistant needs: the @id@ (the Gmail API message id — addresses
 `read_body` / `modify_labels` / `fetch_attachment`), the @thread_id@ (the conversation it belongs to —
@@ -333,17 +344,18 @@ agent list_recent(query: string, max_results: integer ?= 10) -> array[message] {
   }
 }
 
-@"Tool: read a message's text body by @id@. Fetches the full message and returns its decoded body,
-preferring the `text/plain` part — the `payload.body.data` (or, for a `multipart/*` message, the first
-`text/plain` descendant's `body.data`) base64url-decoded to real text. A message with no plain-text part
-anywhere (an HTML-only mail — a newsletter, a receipt, most mail a company sends) returns its `text/html`
-part's MARKUP instead, prefixed with one line saying so: the markup is the whole substance of such a mail
-and reads perfectly well, whereas returning nothing would report a full message as blank. Expect tags, and
-expect a long HTML mail to be a long result. A message with neither part falls back to Gmail's SNIPPET —
-the short plain-text preview the API carries on every resource — so the tool always returns something
-readable. ATTACHMENTS are not part of the body: they are listed on the `message` (`list_recent`) and
-fetched by `fetch_attachment`."
-agent read_body(id: string) -> string {
+@"Tool: read a message's body by @id@. Returns the body as a `message_body` — the @text@ and the
+@content_type@ of the part it came from — so a reader always knows WHAT it is holding. The preference is
+`text/plain` (the `payload.body.data`, or for a `multipart/*` message the first `text/plain` descendant's,
+base64url-decoded to real text); a message with no plain-text part anywhere — an HTML-only mail, which a
+newsletter, a receipt and most mail a company sends all are — comes back with @content_type@
+\"text/html\" and its MARKUP as the text, because that markup is the whole substance of such a mail and
+reads perfectly well, whereas nothing at all would report a full message as blank. Expect tags in that
+case, and expect a long HTML mail to be a long result. A message with neither part comes back with
+@content_type@ \"\" and Gmail's SNIPPET — the short plain-text preview the API carries on every resource —
+so the read is never empty-handed. ATTACHMENTS are not part of the body: they are listed on the `message`
+(`list_recent`) and fetched by `fetch_attachment`."
+agent read_body(id: string) -> message_body {
   let resource = get_message_resource(id = id, context = "read_body")
   let payload = json.field(target = resource, key = "payload")
   let plain = decode_part_text(payload = payload, mime_type = "text/plain")
@@ -352,15 +364,16 @@ agent read_body(id: string) -> string {
     // WHY the markup rather than the snippet: an HTML-only mail keeps its entire content in the
     // `text/html` part, and a model reads HTML as well as it reads prose — so answering "what did that
     // newsletter say" with two lines of preview, or with nothing, is wrong in the quiet way that looks
-    // like an empty mail. The one-line prefix is what makes the fallback VISIBLE: a reader, model or
-    // program, can tell markup from prose without inspecting the text for tags.
+    // like an empty mail. What makes the fallback visible is the content type RIDING ALONGSIDE the text:
+    // the caller dispatches on data it was handed, instead of on an announcement this package would
+    // otherwise have written into the prose for it.
     if (string.is_blank(value = markup)) {
-      json.text(target = json.field(target = resource, key = "snippet"))
+      message_body(content_type = "", text = json.text(target = json.field(target = resource, key = "snippet")))
     } else {
-      f"[no text/plain part — the message's text/html markup follows]\n${markup}"
+      message_body(content_type = "text/html", text = markup)
     }
   } else {
-    plain
+    message_body(content_type = "text/plain", text = plain)
   }
 }
 
