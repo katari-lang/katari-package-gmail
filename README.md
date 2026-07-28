@@ -20,9 +20,12 @@ credentials core, reached through the stdlib's `oauth.token`.
   the sent message's id; pass `thread_id` + `in_reply_to` to **reply inside a conversation**.
 - `gmail.modify_labels(id, add ?= [], remove ?= [])` — add and remove label ids. Removing `"UNREAD"` is
   how a message is marked read; there is no delete, at any privilege.
-- `gmail.watch(query, poll_interval_milliseconds, deliver_to)` — a daemon that delivers each **arriving**
-  message matching `query` to `deliver_to`, oldest first. What it reports is an *arrival*, not a match
-  (see [Usage: the watch](#usage-the-watch)). Never resolves; composes under `parallel [ … ]`.
+- `gmail.watch(query, poll_interval_milliseconds, cursor_at, deliver_to)` — a daemon that delivers each
+  **arriving** message matching `query` to `deliver_to(value = …)`, oldest first. It is `poll.subscribe`
+  (stdlib) under a Gmail adapter: **at-least-once**, with `cursor_at` deciding whether a restart delivers
+  the mail that arrived while the watch was down or skips it (see
+  [Usage: the watch](#usage-the-watch)). What it reports is an *arrival*, not a match. Never resolves;
+  composes under `parallel [ … ]`.
 - `gmail.provider(source = ...)` — provides the capability the tools require (`credential`) for the
   extent of a continuation, by resolving a `credentials.source` through the runtime on every ask. The
   provider holds no secret and keeps no cache: the runtime owns the token material, serves the stored
@@ -31,7 +34,9 @@ credentials core, reached through the stdlib's `oauth.token`.
   never to a user-facing boundary.
 
 The same stored Google credential serves the `google_calendar` package; give it a Gmail scope and both
-read through one login.
+read through one login. They also share their plumbing: the `Bearer` header, the 401/403 classification
+and the authenticated GET live in the **`google_common`** package, which both depend on. You never import
+it — it arrives as their transitive dependency.
 
 ## Reading mail
 
@@ -103,7 +108,7 @@ as one downstream.
 
 ```katari
 @"The first attachment of a message, as a file, or null when it has none."
-agent first_attachment(message: gmail.message) -> file | null with gmail.credential | io | prelude.throw[gmail.gmail_error | files.malformed_base64 | http.fetch_error | json.parse_error] {
+agent first_attachment(message: gmail.message) -> file | null with gmail.credential | io | prelude.throw[http.api_failure | files.malformed_base64 | http.fetch_error | json.parse_error] {
   match (array.get(target = message.attachments, index = 0)) {
     case null -> null
     case entry -> gmail.fetch_attachment(id = message.id, attachment_id = entry.attachment_id)
@@ -111,7 +116,7 @@ agent first_attachment(message: gmail.message) -> file | null with gmail.credent
 }
 
 @"Every PDF a message carries — the filter is the app's, over data the message already has."
-agent pdf_attachments(message: gmail.message) -> array[file] with gmail.credential | io | prelude.throw[gmail.gmail_error | files.malformed_base64 | http.fetch_error | json.parse_error] {
+agent pdf_attachments(message: gmail.message) -> array[file] with gmail.credential | io | prelude.throw[http.api_failure | files.malformed_base64 | http.fetch_error | json.parse_error] {
   array.flatten(target = for (let entry in message.attachments) {
     next if (entry.content_type == "application/pdf") {
       [gmail.fetch_attachment(id = message.id, attachment_id = entry.attachment_id)]
@@ -140,7 +145,7 @@ threads it too.
 
 ```katari
 @"Reply inside the conversation a message came from."
-agent reply(message: gmail.message, text: string) -> string with gmail.credential | io | prelude.throw[gmail.gmail_error | http.fetch_error | json.parse_error] {
+agent reply(message: gmail.message, text: string) -> string with gmail.credential | io | prelude.throw[http.api_failure | http.fetch_error | json.parse_error] {
   gmail.send(
     to = message.sender,
     subject = f"Re: ${message.subject}",
@@ -166,15 +171,20 @@ Three meanings, decided at three boundaries:
 - **`oauth.server_error`** (stdlib) — the token could not be resolved for a **transient** reason: a
   network error, or the token endpoint failing while refreshing. Thrown at the provider; retry it like
   any transport blip.
-- **`gmail.gmail_error = gmail.auth_error | gmail.api_error`** — the Gmail API's own failures, classified
-  once:
-  - `auth_error` — a 401/403: Google rejected the resolved access token (revoked before its stored
+- **`http.api_failure = http.auth_error | http.api_error`** (stdlib) — the Gmail API's own failures, classified
+  once in `google_common.classify_api_error`:
+  - `http.auth_error` — a 401/403: Google rejected the resolved access token (revoked before its stored
     expiry, or scoped too narrowly). Retrying the *same* token does not help, but **replaying the call
     does**: the re-run resolves the token afresh, the runtime refreshes the credential once its stored
     lifetime passes, and a credential the runtime cannot refresh parks the run as a re-authorization
     prompt. No app-owned escalation is needed.
-  - `api_error` — any other non-2xx (a bad request, a missing message, a quota or server error). Usually
-    transient; a plain backoff is the right response.
+  - `http.api_error` — any other non-2xx (a bad request, a missing message, a quota or server error).
+    Usually transient; a plain backoff is the right response.
+
+  The pair is the **stdlib's**, not this package's: `google_calendar` and every other authenticated REST
+  package classify into the same two variants, so one `replay` converter covers all of them at once.
+  (This package used to declare its own `gmail_error = auth_error | api_error` — identical, down to the
+  paragraph, to `google_calendar`'s.)
 
 `fetch_attachment` adds `files.malformed_base64` for a corrupt payload — a bad reply, not a bad token.
 
@@ -216,7 +226,7 @@ In the admin console, open your project's **Credentials** page and press **Regis
 `gmail.modify` is Google's read/write scope short of permanent deletion, and it authorizes every call
 this package makes — list, get, `attachments.get`, send, label edits. An app that only ever reads can
 register `gmail.readonly` instead and not call `send` / `modify_labels`; a narrower scope makes the
-writes come back as `auth_error`, since Google reports "not permitted" as a 403.
+writes come back as `http.auth_error`, since Google reports "not permitted" as a 403.
 
 The extra parameters matter for Google specifically: `access_type=offline` is what makes Google issue a
 **refresh token** (without it the credential dies when the first access token expires), and
@@ -241,7 +251,7 @@ one per scope: `use gmail.provider(source = credentials.oauth(name = "google_wor
 ```katari
 import gmail
 
-agent recent(query: string) -> array[gmail.message] with io | prelude.throw[gmail.gmail_error | oauth.server_error | env.missing_secret | http.fetch_error | json.parse_error] {
+agent recent(query: string) -> array[gmail.message] with io | prelude.throw[http.api_failure | oauth.server_error | env.missing_secret | http.fetch_error | json.parse_error] {
   use gmail.provider(source = credentials.oauth(name = "google"))
   gmail.list_recent(query = query, max_results = 5)
 }
@@ -264,20 +274,35 @@ you star, label or mark unread — is not delivered either. This is the right sh
 incoming mail, and the wrong one for a general "tell me whenever anything matches this search" trigger;
 `list_recent` is what answers the latter.
 
-What rides between ticks is a **watermark**, not a set of seen ids. The watch primes a cursor at the
-instant it starts and each tick searches `<query> after:<cursor>`, so the backlog sits below the cursor
-and a message the cursor has passed can never come back. The cursor advances by the **delivered
-messages' own** `internalDate` — Gmail's receive clock — never by the poller's, so a slow tick, a long
-turn or a skewed clock cannot step over mail; the poller's clock enters once, to cap how far one tick may
-carry the cursor, which can only hold it back. Its only companion memory is the handful of ids delivered
-at the cursor's own second, which is what makes the second-granular `after:` boundary safe in either
-direction — so the memory is **constant**, not the delivered history.
+Under the hood it is **`poll.subscribe`** — the stdlib's durable-subscription skeleton — with a Gmail
+adapter, so it speaks that module's guarantees rather than its own.
 
-Delivery is **at-least-once**. The cursor is durable, so a crash-recovery restart resumes where it stood,
-at worst re-delivering the one message whose `deliver_to` had returned without its commit landing. A
-**replay re-run is different**: the fresh activation takes a fresh cursor at that moment, so mail that
-arrived while the failed activation was down is skipped rather than replayed at you. Within one
-activation a tick drains *every* page of its listing, so a watch whose runtime was stopped for a while
+What rides between ticks is a **watermark** (`poll.watermark(overlap = 1000)`), not a set of seen ids. The
+subscription primes a cursor at the instant it starts and each tick searches `<query> after:<cursor>`, so
+the backlog sits below the cursor and a message the cursor has passed can never come back. The cursor
+advances by the **delivered messages' own** `internalDate` — Gmail's receive clock — never by the
+poller's, so a slow tick, a long turn or a skewed clock cannot step over mail; the poller's clock enters
+once, to cap how far one tick may carry the cursor, which can only hold it back. Its only companion
+memory is the ids inside the 1000 ms overlap the fetch re-lists, which is what makes the second-granular
+`after:` boundary safe in either direction — so the memory is **constant**, not the delivered history.
+
+**Delivery is at-least-once.** A message reaches `deliver_to` one or more times, never zero: the commit
+lands only after a delivery returns, so a crash or a throw in between re-delivers exactly that message on
+the next tick. **Exactly-once is built at the destination**, by making the delivery idempotent — key it on
+the message's `id`, which is the identity the subscription already promises is stable (label a message
+rather than reply to it; upsert rather than insert).
+
+**`cursor_at` decides what a restart does**, and there is no default — this is the consequential choice:
+
+- `poll.resume(key = "…")` keeps the cursor in the **store**, so a runtime restart, a re-forked fiber and
+  a `replay` re-run all resume from it: the mail that arrived while the watch was **down** is delivered,
+  oldest first, on the tick after it comes back. This is what a persisted, re-forked or replayed watch
+  wants. Give each watch a key of its own; two watches sharing one overwrite each other's cursor.
+- `poll.fresh()` keeps it in the run alone: every fresh activation re-primes at that moment, and the
+  downtime is skipped for good and silently. Choose it when re-priming *is* the semantics — a probe, a
+  test, a watch whose backlog is worthless.
+
+Within one activation a tick drains *every* page of its listing, so a watch that resumes after a long gap
 catches up on the whole backlog that arrived meanwhile, oldest first.
 
 The first poll is one `poll_interval_milliseconds` in, so a message arriving just after the watch starts
@@ -287,18 +312,26 @@ waits up to one interval — pending, not lost.
 import gmail
 
 @"Mark every arriving promotion read as it lands."
-agent file_arrivals() -> never with io | prelude.throw[gmail.gmail_error | oauth.server_error | env.missing_secret | http.fetch_error | json.parse_error] {
+agent file_arrivals() -> never with io | store.get | store.set | prelude.throw[http.api_failure | oauth.server_error | env.missing_secret | http.fetch_error | json.parse_error] {
   use gmail.provider(source = credentials.oauth(name = "google"))
-  agent mark_read(message: gmail.message) -> null with gmail.credential | io | prelude.throw[gmail.gmail_error | http.fetch_error] {
-    gmail.modify_labels(id = message.id, remove = ["UNREAD"])
+  // `deliver_to`'s parameter is named `value` — the prelude's primary-argument rule, which
+  // `poll.subscribe` fixes for every watch built on it.
+  agent mark_read(value: gmail.message) -> null with gmail.credential | io | prelude.throw[http.api_failure | http.fetch_error] {
+    gmail.modify_labels(id = value.id, remove = ["UNREAD"])
   }
   gmail.watch(
     query = "category:promotions",
     poll_interval_milliseconds = 300000.0,
+    // Deliver what arrived while the process was down, rather than skipping it.
+    cursor_at = poll.resume(key = "promotions-watch"),
     deliver_to = mark_read,
   )
 }
 ```
+
+Marking a message read is idempotent on its `id`, which is exactly the shape an at-least-once delivery
+asks of its destination: a re-delivered message is removed from `UNREAD` a second time and nothing else
+happens.
 
 `deliver_to`'s effects flow out to the caller's handlers unchanged, so a delivery may itself call other
 tools — read the body, fetch an attachment, reply, label. The watch never resolves, so it runs as a
@@ -316,16 +349,22 @@ the rest of a block, but knows nothing about what counts as retriable: it catche
 your code — an ordinary `use handler` (a **converter**) between the provider and the block.
 
 Under `oauth.token` the policy collapses to almost nothing, because re-authorization is no longer the
-app's problem: replay the transient failures **and `auth_error`** (the re-run re-resolves the token, and a
-credential that needs a human pauses on the runtime's own authorize escalation), and re-raise the wiring
-defects.
+app's problem: replay the transient failures **and `http.auth_error`** (the re-run re-resolves the token,
+and a credential that needs a human pauses on the runtime's own authorize escalation), and re-raise the
+wiring defects. With `cursor_at = poll.resume(...)` the backoff costs nothing but latency — the cursor
+outlives the failed activation, so the mail that arrived during it is delivered once the watch is back.
 
 Two rules the converter must obey — both because a `throw` handler catches the **whole** throw union of
 the block it guards, not a subset:
 
-1. **Name every failure the block can raise.** Below that is `gmail.auth_error | gmail.api_error`, plus
-   `oauth.server_error` / `env.missing_secret` from the provider and `http.fetch_error` /
-   `json.parse_error` from the calls — and whatever `deliver_to` itself throws.
+1. **Name every failure the block can raise.** Below that is `http.api_failure` (`http.auth_error |
+   http.api_error`), plus `oauth.server_error` / `env.missing_secret` from the provider and
+   `http.fetch_error` / `json.parse_error` from the calls — and whatever `deliver_to` itself throws.
+   Because that pair is the **stdlib's**, the same converter covers a `google_calendar` arm added beside
+   this one without naming a second package's error sum.
+3. **Carry the cursor's store ops in the row.** `cursor_at = poll.resume(...)` is a `store.get` / a
+   `store.set` per commit, so an agent wrapping the watch declares them (`with io | store.get | store.set
+   | …`) — they resolve wherever the app installs its `store.workspace` / `store.scope`.
 2. **Reconstruct a re-raised failure** rather than re-throwing the match scrutinee: `prelude.throw(error
    = error)` would widen the residual back to the whole union, so each propagated case rebuilds its own
    value.
@@ -334,15 +373,15 @@ the block it guards, not a subset:
 import gmail
 
 @"The watch under one converter: replay the transient failures and the rejected tokens, propagate the defects."
-agent file_arrivals_resiliently() -> never with io | prelude.throw[env.missing_secret] {
-  agent mark_read(message: gmail.message) -> null with gmail.credential | io | prelude.throw[gmail.gmail_error | http.fetch_error] {
-    gmail.modify_labels(id = message.id, remove = ["UNREAD"])
+agent file_arrivals_resiliently() -> never with io | store.get | store.set | prelude.throw[env.missing_secret] {
+  agent mark_read(value: gmail.message) -> null with gmail.credential | io | prelude.throw[http.api_failure | http.fetch_error] {
+    gmail.modify_labels(id = value.id, remove = ["UNREAD"])
   }
   // MECHANISM: re-run the block after a backoff (100ms, doubling, capped at a minute).
   use replay.forever(initial_delay_milliseconds = 100.0, factor = 2.0, max_delay_milliseconds = 60000.0)
   // POLICY: names every failure the block can throw, then dispatches.
   use handler {
-    request prelude.throw(error: gmail.auth_error | gmail.api_error | oauth.server_error | env.missing_secret | http.fetch_error | json.parse_error) -> never {
+    request prelude.throw(error: http.api_failure | oauth.server_error | env.missing_secret | http.fetch_error | json.parse_error) -> never {
       match (error) {
         // A credential that is not registered at all is a wiring defect: no backoff fixes it.
         case env.missing_secret(key => key, message => message) -> { prelude.throw(error = env.missing_secret(key = key, message = message)) }
@@ -357,13 +396,16 @@ agent file_arrivals_resiliently() -> never with io | prelude.throw[env.missing_s
   gmail.watch(
     query = "category:promotions",
     poll_interval_milliseconds = 300000.0,
+    // The cursor lives in the store, so the backoff loses nothing: the re-run resumes where the failed
+    // activation stood and delivers what arrived while it was backing off.
+    cursor_at = poll.resume(key = "promotions-watch"),
     deliver_to = mark_read,
   )
 }
 ```
 
-An `api_error` replay re-runs the same call past a transient fault; an `auth_error` replay is a **token
-re-resolution** whose end state, when a human really is needed, is the runtime's own re-authorization
+An `http.api_error` replay re-runs the same call past a transient fault; an `http.auth_error` replay is a
+**token re-resolution** whose end state, when a human really is needed, is the runtime's own re-authorization
 pause. Until the rejected token's stored lifetime passes — at most about an hour — the replays re-see the
 same token and fail again, which is why a capped backoff like `replay.forever`, not `replay.immediate`, is
 the right mechanism here.

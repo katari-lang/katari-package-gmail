@@ -1,6 +1,6 @@
 [package]
 name = "gmail"
-version = "0.3.0"
+version = "0.4.0"
 description = "Gmail tools (list_recent / read_body / fetch_attachment / send / modify_labels / watch) authenticated through the runtime's stored OAuth credential (oauth.token) — pure Katari, no sidecar."
 
 [runtime]
@@ -9,4 +9,4 @@ url = "http://localhost:3000"
 [dependencies]
 registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
 snapshot = "staging"
-packages = []
+packages = ["google_common"]
