@@ -1,6 +1,6 @@
 [package]
 name = "gmail"
-version = "0.4.0"
+version = "0.5.0"
 description = "Gmail tools (list_recent / read_body / fetch_attachment / send / modify_labels / watch) authenticated through the runtime's stored OAuth credential (oauth.token) — pure Katari, no sidecar."
 
 [runtime]
@@ -10,3 +10,9 @@ url = "http://localhost:3000"
 registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
 snapshot = "staging"
 packages = ["google_common"]
+
+# DEV WIRING: `call` (and the v2 error vocabulary under it) is google_common 0.2.0, which is not published
+# yet, so this package compiles against the sibling checkout. Drop this override once 0.2.0 is on the
+# registry snapshot.
+[overrides.google_common]
+path = "../google_common"

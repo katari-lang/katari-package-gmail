@@ -17,18 +17,23 @@
 // `prelude.oauth.authorize` escalation and resumes once the browser flow completes; this package neither
 // sees nor classifies that state. (2) A transient token-resolution failure (a network error, a
 // token-endpoint 5xx) is `oauth.server_error`, thrown at the provider. (3) The Gmail API's own failures are
-// the STDLIB's classified pair, `http.api_failure` (`http.auth_error` | `http.api_error`), decided once in
-// `google_common.classify_api_error`: a 401/403 is `http.auth_error` (Google rejected the resolved token —
-// a replay re-resolves it, and a credential the runtime cannot refresh parks as a re-authorization prompt),
-// every other non-2xx is `http.api_error` (a bad request, a quota or server error — a plain backoff's
-// case). The pair used to be this package's own nominal declaration and `google_calendar`'s too, identical
-// down to the paragraph; shared, an app writes ONE replay converter for every API behind it.
+// the STDLIB's classified pair, `http.api_failure` (`http.auth_error` | `http.api_error`), decided once by
+// `http.classify_status`: a 401/403 is `http.auth_error` (Google rejected the resolved token — a replay
+// re-resolves it, and a credential the runtime cannot refresh parks as a re-authorization prompt), every
+// other non-2xx is `http.api_error` (a bad request, a quota or server error — a plain backoff's case), and
+// BOTH CARRY THE STATUS, so a retry policy downstream reads a number rather than a sentence. The pair used
+// to be this package's own nominal declaration and `google_calendar`'s too, identical down to the
+// paragraph; shared, an app writes ONE replay converter for every API behind it.
 //
-// The Google plumbing under that — the `Bearer` header, the classification, the authenticated GET — lives
+// The Google plumbing under that — the `Bearer` header, the classification, the authenticated call — lives
 // in `google_common`, because `gmail` and `google_calendar` are two views of one account behind one OAuth
 // credential and had grown byte-for-byte identical copies of all three. What stays HERE is what is Gmail's:
 // the `credential` request and its `provider` (a request is this package's own capability, not a shared
-// one), the endpoints, and the parsing.
+// one), the endpoints, and the parsing. `gmail_call` is the ONE agent that adds the `credential` ask to
+// `google_common.call`, and every endpoint in this file — the reads through `gmail_get`, and `send` and
+// `modify_labels` directly — goes through it. `send` and `modify_labels` used to spell their own
+// `http.fetch` → 2xx test → classify block, because the shared helper answered only GET; that block is the
+// shared one's now, and the verb is an argument.
 //
 // The `watch` daemon is `poll.subscribe` — the stdlib's durable-subscription skeleton — with a Gmail
 // ADAPTER, and nothing else. It used to be ~130 lines of hand-rolled watermark loop here, and
@@ -56,10 +61,11 @@
 import google_common
 
 // A Gmail API failure is `http.api_failure` (`http.auth_error` | `http.api_error`) — the STDLIB's
-// classified pair, not a `gmail_error` of this package's own. `google_common.classify_api_error` decides
-// which at the one boundary where a response's status is read: 401/403 is the credential's problem (a
-// replay's re-resolution is what fixes it, and a refresh-dead credential parks the run on the runtime's
-// re-authorization prompt), everything else is the call's (back off and replay as-is).
+// classified pair, not a `gmail_error` of this package's own, and the STDLIB's classifier decides which
+// (`google_common.classify_api_error` is the name Google packages spell it under). One boundary reads a
+// response's status: 401/403 is the credential's problem (a replay's re-resolution is what fixes it, and a
+// refresh-dead credential parks the run on the runtime's re-authorization prompt), everything else is the
+// call's (back off and replay as-is, reading `api_error.status` to decide whether it is worth repeating).
 
 @"One attachment a message carries, as Gmail describes it: the @filename@ the sender gave it (\"\" when it
 has none, which an inline image often does), the @content_type@ the mail declares for it (e.g.
@@ -74,13 +80,14 @@ data attachment(filename: string, content_type: string, size: integer, attachmen
 
 @"A message's body as read: the @text@ itself, and the @content_type@ of the part that text came from —
 \"text/plain\" for an ordinary mail, \"text/html\" when the message had no plain-text part (@text@ is then
-MARKUP, tags and all), or \"\" when it had neither and @text@ is Gmail's short SNIPPET preview rather than
-a body at all. The type is a FIELD, not a sentence prefixed to the text: an announcement written into the
-prose would fix one consumer's presentation inside this package, where nobody can inspect or override it
-and every other consumer has to parse it back out — a reader that wants to strip the tags, or render the
-markup, or ignore the distinction entirely needs the type as data. (\"\" for \"none\" is the convention
-`files.content_type` and `header_value` already use here.)"
-data message_body(content_type: string, text: string)
+MARKUP, tags and all), or `null` when it had neither and @text@ is Gmail's short SNIPPET preview rather
+than a body at all. The type is a FIELD, not a sentence prefixed to the text: an announcement written into
+the prose would fix one consumer's presentation inside this package, where nobody can inspect or override
+it and every other consumer has to parse it back out — a reader that wants to strip the tags, or render
+the markup, or ignore the distinction entirely needs the type as data. ABSENCE IS `null`, not `\"\"`: a
+media type is a string, so an empty one is a string a broken server could actually send, and the two
+readings are told apart by the type rather than by a convention a reader has to know."
+data message_body(content_type: string | null, text: string)
 
 @"A read message trimmed to what an assistant needs: the @id@ (the Gmail API message id — addresses
 `read_body` / `modify_labels` / `fetch_attachment`), the @thread_id@ (the conversation it belongs to —
@@ -132,14 +139,21 @@ agent provider[R, effect E](
 
 // ── shared Gmail GET ─────────────────────────────────────────────────────────
 
-@"Issue an authenticated GET to a Gmail API @url@ and return its parsed JSON body — every read
-(`list_recent`, `read_body`, `get_message`, and `watch`'s poll) goes through here. The `Bearer` header, the
-2xx check and the classification are `google_common.google_get`'s; what this adds is the ONE thing that is
-Gmail's, the `credential` ask, so no call site has to spell it. A non-2xx becomes
-`google_common.classify_api_error(@context@, ...)` (401/403 → `http.auth_error`, else `http.api_error`);
-@context@ names the caller for the message."
+@"Issue an authenticated Gmail API call — @method@ to @url@ with @body@ (a value tree, or `null` for a
+call carrying no document) — and return the reply parsed as JSON, or `null` for an empty one. Every
+endpoint in this package goes through here. The `Bearer` header, the 2xx check and the classification are
+`google_common.call`'s; what this adds is the ONE thing that is Gmail's, the `credential` ask, so no call
+site has to spell it. A non-2xx becomes `google_common.classify_api_error(@context@, ...)` (401/403 →
+`http.auth_error`, else `http.api_error`); @context@ names the caller for the message."
+agent gmail_call(method: string, url: string, body: unknown | null, context: string) -> unknown {
+  google_common.call(method = method, url = url, body = body, context = context, token = credential())
+}
+
+@"Issue an authenticated GET to a Gmail API @url@ and return its parsed JSON body — `gmail_call` with the
+method fixed and no request document, which is every read (`list_recent`, `read_body`, `get_message`, and
+`watch`'s poll)."
 agent gmail_get(url: string, context: string) -> unknown {
-  google_common.google_get(url = url, context = context, token = credential())
+  gmail_call(method = "GET", url = url, body = null, context = context)
 }
 
 // ── response parsing (read out of json) ──────────────────────────────────────
@@ -321,9 +335,9 @@ newsletter, a receipt and most mail a company sends all are — comes back with 
 \"text/html\" and its MARKUP as the text, because that markup is the whole substance of such a mail and
 reads perfectly well, whereas nothing at all would report a full message as blank. Expect tags in that
 case, and expect a long HTML mail to be a long result. A message with neither part comes back with
-@content_type@ \"\" and Gmail's SNIPPET — the short plain-text preview the API carries on every resource —
-so the read is never empty-handed. ATTACHMENTS are not part of the body: they are listed on the `message`
-(`list_recent`) and fetched by `fetch_attachment`."
+@content_type@ `null` and Gmail's SNIPPET — the short plain-text preview the API carries on every
+resource — so the read is never empty-handed. ATTACHMENTS are not part of the body: they are listed on the
+`message` (`list_recent`) and fetched by `fetch_attachment`."
 agent read_body(id: string) -> message_body {
   let resource = get_message_resource(id = id, context = "read_body")
   let payload = json.field(target = resource, key = "payload")
@@ -337,7 +351,7 @@ agent read_body(id: string) -> message_body {
     // the caller dispatches on data it was handed, instead of on an announcement this package would
     // otherwise have written into the prose for it.
     if (string.is_blank(value = markup)) {
-      message_body(content_type = "", text = json.text(target = json.field(target = resource, key = "snippet")))
+      message_body(content_type = null, text = json.text(target = json.field(target = resource, key = "snippet")))
     } else {
       message_body(content_type = "text/html", text = markup)
     }
@@ -445,44 +459,47 @@ agent fetch_attachment(id: string, attachment_id: string) -> file {
 @"Tool: send a plain-text email from the authenticated user. @to@ is the recipient address, @subject@ the
 subject line, @body@ the message body. Returns the sent message's id. To REPLY inside a conversation, pass
 @thread_id@ (a message's `thread_id`, so Gmail files the reply in that thread) and @in_reply_to@ (the
-message's `message_id` — its RFC822 `Message-ID` header, read from `list_recent`); both default empty for a
-fresh send. When @in_reply_to@ is given it becomes the reply's `In-Reply-To` and `References` headers, so a
-mail client threads it too. (Compose the @subject@ yourself — prefix \"Re: \" for a reply.) The RFC822
-message is base64url-encoded into the ordinary `messages.send` `raw` field. Raises `http.api_failure`
-(`http.auth_error` | `http.api_error`) on a non-2xx reply."
-agent send(to: string, subject: string, body: string, thread_id: string ?= "", in_reply_to: string ?= "") -> string {
+message's `message_id` — its RFC822 `Message-ID` header, read from `list_recent`); both default to `null`,
+which is a fresh send. When @in_reply_to@ is given it becomes the reply's `In-Reply-To` and `References`
+headers, so a mail client threads it too. (Compose the @subject@ yourself — prefix \"Re: \" for a reply.)
+The RFC822 message is base64url-encoded into the ordinary `messages.send` `raw` field. Raises
+`http.api_failure` (`http.auth_error` | `http.api_error`) on a non-2xx reply."
+agent send(
+  to: string,
+  subject: string,
+  body: string,
+  thread_id: string | null ?= null,
+  in_reply_to: string | null ?= null,
+) -> string {
   // A reply carries `In-Reply-To` / `References` naming the parent's RFC822 Message-ID, so a mail client
-  // threads it (Gmail also threads server-side via `threadId` below). Empty `in_reply_to` (a fresh send)
-  // adds no such headers. Since the parent's own References chain is not exposed, `References` is just the
-  // parent — RFC 5322's accepted fallback when the ancestor chain is unknown.
+  // threads it (Gmail also threads server-side via `threadId` below). An absent `in_reply_to` (a fresh
+  // send) adds no such headers. Since the parent's own References chain is not exposed, `References` is
+  // just the parent — RFC 5322's accepted fallback when the ancestor chain is unknown.
   let reply_headers = match (in_reply_to) {
-    case "" -> ""
+    case null -> ""
     case parent -> f"In-Reply-To: ${parent}\r\nReferences: ${parent}\r\n"
   }
   // An RFC 5322 message: the To / Subject (and any reply) headers, a blank line, then the body. CRLF
   // separates header lines and the header/body boundary, as the mail format requires.
   let raw = f"To: ${to}\r\nSubject: ${subject}\r\n${reply_headers}\r\n${body}"
   // The ordinary `messages.send` with the message base64url-encoded in the `raw` field — the standard
-  // path, now that `string.to_base64url` exists. `http.fetch` (not `post_json`) keeps the custom
-  // 401/403 → `auth_error` classification, like every other write here.
-  let base: record[unknown] = { raw = string.to_base64url(value = raw) }
-  // `threadId` files the message in an existing conversation; omitted (empty `thread_id`) it starts a new
-  // one, so an omitted arg is a smaller request rather than a blank field.
-  let payload = match (thread_id) {
-    case "" -> base
-    case conversation -> record.set(target = base, key = "threadId", value = conversation)
-  }
-  let response = http.fetch(
-    url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-    method = "POST",
-    headers = google_common.bearer(token = credential()),
-    body = http.json(value = payload),
+  // path, now that `string.to_base64url` exists. `threadId` files the message in an existing conversation;
+  // omitted (`thread_id` absent) it starts a new one, so an omitted arg is a smaller request rather than a
+  // blank field — which is what `record.set_if` says in one line.
+  let payload = record.set_if[unknown](
+    target = { raw = string.to_base64url(value = raw) },
+    key = "threadId",
+    value = thread_id,
   )
-  if (response.status >= 200 && response.status < 300) {
-    json.text(target = json.field(target = json.parse(text = response.body), key = "id"))
-  } else {
-    prelude.throw(error = google_common.classify_api_error(context = "send", status = response.status, body = response.body))
-  }
+  json.text(target = json.field(
+    target = gmail_call(
+      method = "POST",
+      url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+      body = payload,
+      context = "send",
+    ),
+    key = "id",
+  ))
 }
 
 @"Tool: change a message's labels — add the label ids in @add@, remove those in @remove@. The common use is
@@ -491,19 +508,15 @@ marking a message read by removing \"UNREAD\", or filing it by adding a label id
 (`http.auth_error` | `http.api_error`) on a non-2xx reply."
 agent modify_labels(id: string, add: array[string] ?= [], remove: array[string] ?= []) -> null {
   let payload: record[unknown] = { addLabelIds = add, removeLabelIds = remove }
-  // `http.json` serialises the value tree and defaults the application/json Content-Type; the custom
-  // 401/403 → `auth_error` classification is why this keeps `http.fetch` rather than `post_json`.
-  let response = http.fetch(
-    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}/modify",
+  // The reply is the modified message resource, which this tool does not report: the caller asked for a
+  // label change and gets the fact that it happened.
+  gmail_call(
     method = "POST",
-    headers = google_common.bearer(token = credential()),
-    body = http.json(value = payload),
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}/modify",
+    body = payload,
+    context = "modify_labels",
   )
-  if (response.status >= 200 && response.status < 300) {
-    null
-  } else {
-    prelude.throw(error = google_common.classify_api_error(context = "modify_labels", status = response.status, body = response.body))
-  }
+  null
 }
 
 // ── the watch daemon ─────────────────────────────────────────────────────────

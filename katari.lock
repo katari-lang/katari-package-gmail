@@ -1,0 +1,7 @@
+[lock]
+version = 1
+snapshot = "staging"
+
+[packages.google_common]
+source = "path"
+path = "../google_common"

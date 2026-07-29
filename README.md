@@ -16,8 +16,8 @@ credentials core, reached through the stdlib's `oauth.token`.
 - `gmail.fetch_attachment(id, attachment_id)` — one attachment as a **`file`**, fetched by the message's
   `id` and the `attachment_id` of an entry in its `attachments` (see
   [Attachments](#attachments)).
-- `gmail.send(to, subject, body, thread_id ?= "", in_reply_to ?= "")` — send plain-text mail, returning
-  the sent message's id; pass `thread_id` + `in_reply_to` to **reply inside a conversation**.
+- `gmail.send(to, subject, body, thread_id ?= null, in_reply_to ?= null)` — send plain-text mail,
+  returning the sent message's id; pass `thread_id` + `in_reply_to` to **reply inside a conversation**.
 - `gmail.modify_labels(id, add ?= [], remove ?= [])` — add and remove label ids. Removing `"UNREAD"` is
   how a message is marked read; there is no delete, at any privilege.
 - `gmail.watch(query, poll_interval_milliseconds, cursor_at, deliver_to)` — a daemon that delivers each
@@ -35,8 +35,17 @@ credentials core, reached through the stdlib's `oauth.token`.
 
 The same stored Google credential serves the `google_calendar` package; give it a Gmail scope and both
 read through one login. They also share their plumbing: the `Bearer` header, the 401/403 classification
-and the authenticated GET live in the **`google_common`** package, which both depend on. You never import
-it — it arrives as their transitive dependency.
+and the authenticated **call** — one agent for GET, POST, PATCH and DELETE alike — live in the
+**`google_common`** package, which both depend on. You never import it: it arrives as their transitive
+dependency.
+
+**Breaking in 0.5.0.** Optional arguments that used to default to `""` now default to `null`, and the
+absent body part reports `null` rather than `""` — see [The body](#the-body) and
+[Sending and labelling](#sending-and-labelling). A caller that passed `thread_id = ""` for a fresh send
+now passes nothing (or `null`); a caller that tested `body.content_type == ""` now tests for `null`.
+`http.auth_error` / `http.api_error` also carry a `status` and a `context` now (the stdlib's error
+vocabulary v2), so a handler that reconstructs one has two more fields to fill — matching on the variant
+is unchanged.
 
 ## Reading mail
 
@@ -55,14 +64,14 @@ Only `fetch_attachment` moves bytes.
 `read_body` returns data, not a formatted string:
 
 ```katari
-data message_body(content_type: string, text: string)
+data message_body(content_type: string | null, text: string)
 ```
 
 | `content_type` | `text` is |
 | --- | --- |
 | `"text/plain"` | the message's plain-text body, decoded |
 | `"text/html"` | the message's **markup**, tags and all — it had no plain-text part |
-| `""` | Gmail's short **snippet** preview — the message had neither part |
+| `null` | Gmail's short **snippet** preview — the message had neither part |
 
 A great deal of real mail (a newsletter, a receipt, most mail a company sends) is HTML-only, and its
 whole substance is in that markup. Returning it beats returning nothing, which would report a full
@@ -71,16 +80,22 @@ being announced inside it. Render the markup, strip it, or hand it to a model (w
 the choice is the app's, and nothing here is truncated, so a long HTML mail is a long `text`.
 
 ```katari
-let body = gmail.read_body(id = id)
-match (body.content_type) {
-  case "text/html" -> f"markup (${string.to_string(value = string.length(value = body.text))} characters)"
-  case "" -> f"no body part — Gmail's preview only: ${body.text}"
-  case _ -> body.text
+import gmail
+
+agent describe_body(id: string) -> string with gmail.credential | io | prelude.throw[http.api_failure | http.fetch_error | json.parse_error] {
+  let body = gmail.read_body(id = id)
+  match (body.content_type) {
+    case "text/html" -> f"markup (${string.to_string(value = string.length(value = body.text))} characters)"
+    case null -> f"no body part — Gmail's preview only: ${body.text}"
+    case _ -> body.text
+  }
 }
 ```
 
 (Before 0.3.0 this returned a bare `string`, with the HTML case announced by a line prefixed to the text.
-A consumer reading the result as a string needs `body.text`.)
+A consumer reading the result as a string needs `body.text`. Before 0.5.0 the "neither part" case was
+`""` rather than `null` — a media type is a string, so an empty one is a string a broken server could
+actually send, and absence now has its own value instead of a convention a reader has to know.)
 
 ### Attachments
 
@@ -107,6 +122,8 @@ file records the content type the mail declared for that part, which is what let
 as one downstream.
 
 ```katari
+import gmail
+
 @"The first attachment of a message, as a file, or null when it has none."
 agent first_attachment(message: gmail.message) -> file | null with gmail.credential | io | prelude.throw[http.api_failure | files.malformed_base64 | http.fetch_error | json.parse_error] {
   match (array.get(target = message.attachments, index = 0)) {
@@ -141,9 +158,14 @@ broken file, which is why the tool's failure set is one wider than the other rea
 reply, prefix `"Re: "` — and pass both threading values from the message you are answering: `thread_id`
 files the reply in that Gmail conversation, and `in_reply_to` (the parent's `message_id`, its RFC822
 `Message-ID`, **not** its `id`) writes the `In-Reply-To` / `References` headers so every mail client
-threads it too.
+threads it too. Both default to `null` — a fresh send — and an omitted one is a *smaller request* rather
+than a blank field. (Before 0.5.0 they defaulted to `""`, which read as "not given" the same way; the
+sentinel is gone because absence is `null` everywhere in this ecosystem, not because the behaviour
+changed.)
 
 ```katari
+import gmail
+
 @"Reply inside the conversation a message came from."
 agent reply(message: gmail.message, text: string) -> string with gmail.credential | io | prelude.throw[http.api_failure | http.fetch_error | json.parse_error] {
   gmail.send(
@@ -171,20 +193,23 @@ Three meanings, decided at three boundaries:
 - **`oauth.server_error`** (stdlib) — the token could not be resolved for a **transient** reason: a
   network error, or the token endpoint failing while refreshing. Thrown at the provider; retry it like
   any transport blip.
-- **`http.api_failure = http.auth_error | http.api_error`** (stdlib) — the Gmail API's own failures, classified
-  once in `google_common.classify_api_error`:
+- **`http.api_failure = http.auth_error | http.api_error`** (stdlib) — the Gmail API's own failures,
+  classified once by `http.classify_status` (which `google_common.classify_api_error` is the Google
+  packages' name for). Both variants carry `status`, `context` and `message`:
   - `http.auth_error` — a 401/403: Google rejected the resolved access token (revoked before its stored
     expiry, or scoped too narrowly). Retrying the *same* token does not help, but **replaying the call
     does**: the re-run resolves the token afresh, the runtime refreshes the credential once its stored
     lifetime passes, and a credential the runtime cannot refresh parks the run as a re-authorization
     prompt. No app-owned escalation is needed.
   - `http.api_error` — any other non-2xx (a bad request, a missing message, a quota or server error).
-    Usually transient; a plain backoff is the right response.
+    Read `status` to decide: 408 / 429 / 5xx are worth a backoff, anything else will fail identically
+    until the argument changes.
 
   The pair is the **stdlib's**, not this package's: `google_calendar` and every other authenticated REST
   package classify into the same two variants, so one `replay` converter covers all of them at once.
   (This package used to declare its own `gmail_error = auth_error | api_error` — identical, down to the
-  paragraph, to `google_calendar`'s.)
+  paragraph, to `google_calendar`'s. Before 0.5.0 the shared pair carried only a `message`, with the
+  status folded into its prose; the number rides as a field now so a retry policy compares it.)
 
 `fetch_attachment` adds `files.malformed_base64` for a corrupt payload — a bad reply, not a bad token.
 
@@ -316,7 +341,7 @@ agent file_arrivals() -> never with io | store.get | store.set | prelude.throw[h
   use gmail.provider(source = credentials.oauth(name = "google"))
   // `deliver_to`'s parameter is named `value` — the prelude's primary-argument rule, which
   // `poll.subscribe` fixes for every watch built on it.
-  agent mark_read(value: gmail.message) -> null with gmail.credential | io | prelude.throw[http.api_failure | http.fetch_error] {
+  agent mark_read(value: gmail.message) -> null with gmail.credential | io | prelude.throw[http.api_failure | http.fetch_error | json.parse_error] {
     gmail.modify_labels(id = value.id, remove = ["UNREAD"])
   }
   gmail.watch(
@@ -374,7 +399,7 @@ import gmail
 
 @"The watch under one converter: replay the transient failures and the rejected tokens, propagate the defects."
 agent file_arrivals_resiliently() -> never with io | store.get | store.set | prelude.throw[env.missing_secret] {
-  agent mark_read(value: gmail.message) -> null with gmail.credential | io | prelude.throw[http.api_failure | http.fetch_error] {
+  agent mark_read(value: gmail.message) -> null with gmail.credential | io | prelude.throw[http.api_failure | http.fetch_error | json.parse_error] {
     gmail.modify_labels(id = value.id, remove = ["UNREAD"])
   }
   // MECHANISM: re-run the block after a backoff (100ms, doubling, capped at a minute).
