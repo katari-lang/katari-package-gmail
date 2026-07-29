@@ -1,7 +1,10 @@
 [lock]
 version = 1
 snapshot = "staging"
+katari_compiler = "0.1.0-rc12"
 
 [packages.google_common]
-source = "path"
-path = "../google_common"
+source = "git"
+url = "https://github.com/katari-lang/katari-package-google_common"
+rev = "b9501d2f37e32713afe40edc61569870566b3b92"
+sha256 = "fca1432cfd857a20c4484e1fe7903b7a3f642cde8ee4194969fd8a696fd739b5"
