@@ -431,18 +431,25 @@ agent attachment_content_type(id: string, attachment_id: string) -> string {
 
 @"Tool: fetch ONE of a message's attachments and return it as a file. @id@ is the MESSAGE's id (a
 `list_recent` result's @id@ — not its @message_id@) and @attachment_id@ is the @attachment_id@ of one entry
-in that message's @attachments@ list. The result is a `file` handle: the bytes stay runtime-side, so the
-handle can be passed straight on to any other tool you hold that takes a file — an image viewer, to LOOK
-at a photo, a screenshot or a scanned invoice — while the payload itself never enters the conversation.
-The file records the content type the mail declared for that part, which is what lets a viewer recognise
-an image as one. This only READS: nothing in the mailbox changes, and one call fetches one
-attachment, so ask for the one you actually need. A payload that comes back corrupt throws
-`files.malformed_base64` rather than handing back broken bytes; a non-2xx reply raises `http.api_failure`
-(`http.auth_error` | `http.api_error`)."
-agent fetch_attachment(id: string, attachment_id: string) -> file {
-  // The declared type first, off the message: the attachment endpoint answers with the bytes and a size
-  // only, so the message's own part is the sole place a MIME type can come from.
-  let content_type = attachment_content_type(id = id, attachment_id = attachment_id)
+in that message's @attachments@ list. PASS @content_type@ TOO — the very `content_type` that listing showed
+beside the attachment_id. Gmail regenerates attachment ids on every message read, so when this agent has to
+re-read the message to look the type up itself, the id you hold may no longer match any part and the file
+comes back UNTYPED — a receiver then sees a generic `.bin` it cannot preview. The listing in your hands is
+the reliable source; the re-read is only the fallback when you omit it. The result is a `file` handle: the
+bytes stay runtime-side, so the handle can be passed straight on to any other tool you hold that takes a
+file — a viewer to LOOK at it, or an outbound tool's files to send it onward — while the payload itself
+never enters the conversation. (The file carries a TYPE but no NAME yet, so a receiver sees a generated
+name like `file-1.pdf`; say the real filename in your message when it matters.) This only READS: nothing in
+the mailbox changes, and one call fetches one attachment, so ask for the one you actually need. A payload
+that comes back corrupt throws `files.malformed_base64` rather than handing back broken bytes; a non-2xx
+reply raises `http.api_failure` (`http.auth_error` | `http.api_error`)."
+agent fetch_attachment(id: string, attachment_id: string, @"The content type the listing declared for this attachment; omit to make this agent re-read the message and look it up (unreliable — see above)." content_type: string | null ?= null) -> file {
+  // The caller's declared type first — the listing it read is the same data the lookup would derive,
+  // minus the id-stability hazard; the message re-read is the fallback, not the norm.
+  let content_type = match (content_type) {
+    case null -> attachment_content_type(id = id, attachment_id = attachment_id)
+    case declared -> declared
+  }
   let resource = gmail_get(
     url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}/attachments/${attachment_id}",
     context = "fetch_attachment",

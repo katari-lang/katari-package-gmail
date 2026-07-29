@@ -13,7 +13,7 @@ credentials core, reached through the stdlib's `oauth.token`.
 - `gmail.read_body(id)` — one message's body as a `message_body(content_type, text)`: the `text/plain`
   part when there is one, else the `text/html` part's markup, else Gmail's snippet — and the type says
   which (see [The body](#the-body)).
-- `gmail.fetch_attachment(id, attachment_id)` — one attachment as a **`file`**, fetched by the message's
+- `gmail.fetch_attachment(id, attachment_id, content_type ?= null)` — one attachment as a **`file`**, fetched by the message's
   `id` and the `attachment_id` of an entry in its `attachments` (see
   [Attachments](#attachments)).
 - `gmail.send(to, subject, body, thread_id ?= null, in_reply_to ?= null)` — send plain-text mail,
