@@ -517,7 +517,7 @@ agent modify_labels(id: string, add: array[string] ?= [], remove: array[string] 
   let payload: record[unknown] = { addLabelIds = add, removeLabelIds = remove }
   // The reply is the modified message resource, which this tool does not report: the caller asked for a
   // label change and gets the fact that it happened.
-  gmail_call(
+  let _ = gmail_call(
     method = "POST",
     url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}/modify",
     body = payload,
