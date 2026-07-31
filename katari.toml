@@ -1,6 +1,6 @@
 [package]
 name = "gmail"
-version = "0.5.4"
+version = "0.5.5"
 description = "Gmail tools (list_recent / read_body / fetch_attachment / send / modify_labels / watch) authenticated through the runtime's stored OAuth credential (oauth.token) — pure Katari, no sidecar."
 
 [runtime]
