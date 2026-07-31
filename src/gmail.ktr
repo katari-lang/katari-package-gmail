@@ -115,7 +115,7 @@ request credential() -> string of private
 // On a downstream 401/403 (an access token revoked BEFORE its stored expiry): there is no invalidation
 // channel here, and none is needed. The runtime keeps serving the stored token while its clock says valid, so
 // a mid-lifetime revocation surfaces as `auth_error` on every call for up to one access-token lifetime (≈ an
-// hour for Google) — the bounded worst case. A converter that turns `auth_error` into `replay.interrupted`
+// hour for Google) — the bounded worst case. A converter that turns `auth_error` into `supervise.interrupted`
 // makes the recovery automatic: each re-run asks `credential` afresh, the resolution refreshes once the stored
 // lifetime passes, and a refresh the token endpoint refuses parks the run as a re-authorization prompt.
 @"Provide the Google credential for the extent of the continuation, from @source@ — the
@@ -582,7 +582,7 @@ not delivered twice.)
 
 No retry is built in — a poll failure (an http error, a rejected token, a @deliver_to@ that throws)
 propagates and kills the subscription, exactly as an uncaught failure in any callee does. Compose
-resilience by wrapping the watch in a replay provider (`replay.forever` with a converter that replays the
+resilience by wrapping the watch in a supervise provider (`supervise.forever` with a converter that replays the
 transient blips AND `http.auth_error` — the re-run re-resolves the token, and a credential needing a human
 parks on the runtime's authorize escalation rather than failing). With @cursor_at@ = `poll.resume(...)` the
 backoff costs nothing but latency: the cursor outlives the failed activation, so the mail that arrived

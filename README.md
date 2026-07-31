@@ -206,7 +206,7 @@ Three meanings, decided at three boundaries:
     until the argument changes.
 
   The pair is the **stdlib's**, not this package's: `google_calendar` and every other authenticated REST
-  package classify into the same two variants, so one `replay` converter covers all of them at once.
+  package classify into the same two variants, so one `supervise` converter covers all of them at once.
   (This package used to declare its own `gmail_error = auth_error | api_error` — identical, down to the
   paragraph, to `google_calendar`'s. Before 0.5.0 the shared pair carried only a `message`, with the
   status folded into its prose; the number rides as a field now so a retry policy compares it.)
@@ -366,11 +366,11 @@ tools — read the body, fetch an attachment, reply, label. The watch never reso
 throws — propagates and kills the watch, exactly as an uncaught failure in any callee does. Resilience is
 composed *around* it.
 
-## Composition: resilience with `prelude.replay`
+## Composition: resilience with `prelude.supervise`
 
-`prelude.replay` splits the retry **mechanism** from the failure **policy**. A `replay` *provider* re-runs
+`prelude.supervise` splits the retry **mechanism** from the failure **policy**. A `replay` *provider* re-runs
 the rest of a block, but knows nothing about what counts as retriable: it catches exactly one request,
-`replay.interrupted`, and re-runs after its delay. Deciding *which* failures become an `interrupted` is
+`supervise.interrupted`, and re-runs after its delay. Deciding *which* failures become an `interrupted` is
 your code — an ordinary `use handler` (a **converter**) between the provider and the block.
 
 Under `oauth.token` the policy collapses to almost nothing, because re-authorization is no longer the
@@ -403,7 +403,7 @@ agent file_arrivals_resiliently() -> never with io | store.get | store.set | pre
     gmail.modify_labels(id = value.id, remove = ["UNREAD"])
   }
   // MECHANISM: re-run the block after a backoff (100ms, doubling, capped at a minute).
-  use replay.forever(initial_delay_milliseconds = 100.0, factor = 2.0, max_delay_milliseconds = 60000.0)
+  use supervise.forever(initial_delay_milliseconds = 100.0, factor = 2.0, max_delay_milliseconds = 60000.0)
   // POLICY: names every failure the block can throw, then dispatches.
   use handler {
     request prelude.throw(error: http.api_failure | oauth.server_error | env.missing_secret | http.fetch_error | json.parse_error) -> never {
@@ -411,7 +411,7 @@ agent file_arrivals_resiliently() -> never with io | store.get | store.set | pre
         // A credential that is not registered at all is a wiring defect: no backoff fixes it.
         case env.missing_secret(key => key, message => message) -> { prelude.throw(error = env.missing_secret(key = key, message = message)) }
         // Everything else is transient, a rejected token included — the re-run re-resolves it.
-        case _ -> { replay.interrupted(failure = error) }
+        case _ -> { supervise.interrupted(failure = error) }
       }
     }
   }
@@ -432,5 +432,5 @@ agent file_arrivals_resiliently() -> never with io | store.get | store.set | pre
 An `http.api_error` replay re-runs the same call past a transient fault; an `http.auth_error` replay is a
 **token re-resolution** whose end state, when a human really is needed, is the runtime's own re-authorization
 pause. Until the rejected token's stored lifetime passes — at most about an hour — the replays re-see the
-same token and fail again, which is why a capped backoff like `replay.forever`, not `replay.immediate`, is
+same token and fail again, which is why a capped backoff like `supervise.forever`, not `supervise.immediate`, is
 the right mechanism here.
