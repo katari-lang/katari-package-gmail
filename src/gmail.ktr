@@ -1,130 +1,43 @@
-// A self-contained Gmail tool set — pure Katari, no sidecar: every Gmail API call is `http.fetch` with the
-// request built and the reply parsed as `json` in Katari, and authentication is the runtime's credentials
-// core, reached through `oauth.token`. The tools an app hands to the model (`list_recent` / `read_body` /
-// `fetch_attachment` / `send` / `modify_labels`), a notification watcher (`watch`) that composes under
-// `parallel [ … ]`, and the provider that makes wiring it a one-liner:
-// `use gmail.provider(source = credentials.oauth(name = "google"))`.
-//
-// Authentication is identical to the `google_calendar` package (a shared Google OAuth credential): the
-// provider holds NO secret and keeps NO cache. It takes a credential NAME and serves `credential` by
-// resolving that name through the runtime (`oauth.token`) — the operator registers the Google OAuth client
-// once (with a Gmail scope) and logs in through the runtime-hosted browser flow, after which the runtime
-// owns the token material end to end. The resolved access token is a `string of private` — it flows only
-// toward the `Authorization: Bearer` header and is redacted at every user-facing boundary.
-//
-// Failure has THREE meanings, each decided at its own boundary. (1) A credential that needs a HUMAN —
-// never authorized, or refresh-dead — is never an error: `oauth.token` PARKS the run on a
-// `prelude.oauth.authorize` escalation and resumes once the browser flow completes; this package neither
-// sees nor classifies that state. (2) A transient token-resolution failure (a network error, a
-// token-endpoint 5xx) is `oauth.server_error`, thrown at the provider. (3) The Gmail API's own failures are
-// the STDLIB's classified pair, `http.api_failure` (`http.auth_error` | `http.api_error`), decided once by
-// `http.classify_status`: a 401/403 is `http.auth_error` (Google rejected the resolved token — a replay
-// re-resolves it, and a credential the runtime cannot refresh parks as a re-authorization prompt), every
-// other non-2xx is `http.api_error` (a bad request, a quota or server error — a plain backoff's case), and
-// BOTH CARRY THE STATUS, so a retry policy downstream reads a number rather than a sentence. The pair used
-// to be this package's own nominal declaration and `google_calendar`'s too, identical down to the
-// paragraph; shared, an app writes ONE replay converter for every API behind it.
-//
-// The Google plumbing under that — the `Bearer` header, the classification, the authenticated call — lives
-// in `google_common`, because `gmail` and `google_calendar` are two views of one account behind one OAuth
-// credential and had grown byte-for-byte identical copies of all three. What stays HERE is what is Gmail's:
-// the `credential` request and its `provider` (a request is this package's own capability, not a shared
-// one), the endpoints, and the parsing. `gmail_call` is the ONE agent that adds the `credential` ask to
-// `google_common.call`, and every endpoint in this file — the reads through `gmail_get`, and `send` and
-// `modify_labels` directly — goes through it. `send` and `modify_labels` used to spell their own
-// `http.fetch` → 2xx test → classify block, because the shared helper answered only GET; that block is the
-// shared one's now, and the verb is an argument.
-//
-// The `watch` daemon is `poll.subscribe` — the stdlib's durable-subscription skeleton — with a Gmail
-// ADAPTER, and nothing else. It used to be ~130 lines of hand-rolled watermark loop here, and
-// `google_calendar` had ~120 lines of the same loop with a different memory; the four traps they each
-// learned the hard way (the cursor moves on the SOURCE's clock, never past the tick that observed it, the
-// commit is per item, and a bounded memory forgets by age and never by absence) are invariants of that
-// skeleton now, so this package no longer owns them. What is left is the adapter and only the adapter: list
-// `<query> after:<since>` across every page oldest-first, and answer with each message's dedup key
-// (its id), its own arrival instant (Gmail's `internalDate`) and its payload. The regime is
-// `poll.watermark(overlap = 1000)` — Gmail HAS a monotone receive clock and `after:` lists from an instant,
-// and the 1000 ms overlap is what makes the second-granular, undocumented-inclusivity boundary safe in both
-// readings. Delivery is AT-LEAST-ONCE, in `poll`'s words: a crash between one message's delivery and its
-// commit re-delivers that message and nothing else.
-//
-// Both directions use the stdlib string codecs added for exactly this (`string.to_base64url` /
-// `string.from_base64url` / `string.url_encode`): `send` base64url-encodes the RFC822 message into the
-// ordinary `messages.send` `raw` field, `read_body` base64url-decodes the wanted part's `body.data` to
-// real text (the `text/plain` part, else the `text/html` part's markup, else the snippet — and it returns
-// WHICH one it got as a `message_body`'s content type, so rendering the difference is the app's business
-// and not this package's), and the `q` query is percent-encoded in full. An ATTACHMENT is bytes rather than text and so takes the other road:
-// `fetch_attachment` hands its base64url payload to `files.from_base64` (through `base64url_to_base64`,
-// because the blob producer takes the standard alphabet) and returns a `file`, so the bytes go to the
-// project's blob store and only the slim handle rides the value plane.
+// Gmail tools over Gmail's REST API — pure Katari, no sidecar. The tools an app hands to the model
+// (`list_recent` / `read_body` / `fetch_attachment` / `send` / `modify_labels`), a `watch` daemon built on
+// `poll.subscribe`, and the `provider` that serves the `credential` capability from a stored OAuth
+// credential. The Bearer header, the 2xx test and the failure classification live in `google_common`.
 
 import google_common
 
-// A Gmail API failure is `http.api_failure` (`http.auth_error` | `http.api_error`) — the STDLIB's
-// classified pair, not a `gmail_error` of this package's own, and the STDLIB's classifier decides which
-// (`google_common.classify_api_error` is the name Google packages spell it under). One boundary reads a
-// response's status: 401/403 is the credential's problem (a replay's re-resolution is what fixes it, and a
-// refresh-dead credential parks the run on the runtime's re-authorization prompt), everything else is the
-// call's (back off and replay as-is, reading `api_error.status` to decide whether it is worth repeating).
-
-@"One attachment a message carries, as Gmail describes it: the @filename@ the sender gave it (\"\" when it
-has none, which an inline image often does), the @content_type@ the mail declares for it (e.g.
-\"application/pdf\", \"image/png\"), the @size@ in bytes Gmail estimates for it, and the @attachment_id@
-that `fetch_attachment` fetches it by — together with the MESSAGE's id, since an attachment id names a
-part of one particular message. Plain data: knowing an attachment exists is one thing, and asking for its
-bytes is another (`fetch_attachment`), so a mail can be read and judged without downloading anything.
-Every part whose bytes Gmail holds behind an `attachmentId` is listed, which puts a mail's INLINE images
-(the logo in an HTML signature) in the list beside its real files — the mail declares no difference
-between them, so the list reports what is there and leaves what is worth fetching to its reader."
+@"One attachment a message carries: the @filename@ the sender gave it (\"\" when it has none), the
+@content_type@ the mail declares for it, the @size@ in bytes Gmail estimates, and the @attachment_id@
+`fetch_attachment` takes together with the message's own id. Every part whose bytes Gmail holds behind an
+`attachmentId` is listed, so a mail's inline images sit beside its real files."
 data attachment(filename: string, content_type: string, size: integer, attachment_id: string)
 
-@"A message's body as read: the @text@ itself, and the @content_type@ of the part that text came from —
-\"text/plain\" for an ordinary mail, \"text/html\" when the message had no plain-text part (@text@ is then
-MARKUP, tags and all), or `null` when it had neither and @text@ is Gmail's short SNIPPET preview rather
-than a body at all. The type is a FIELD, not a sentence prefixed to the text: an announcement written into
-the prose would fix one consumer's presentation inside this package, where nobody can inspect or override
-it and every other consumer has to parse it back out — a reader that wants to strip the tags, or render
-the markup, or ignore the distinction entirely needs the type as data. ABSENCE IS `null`, not `\"\"`: a
-media type is a string, so an empty one is a string a broken server could actually send, and the two
-readings are told apart by the type rather than by a convention a reader has to know."
+@"A message's body as read: the @text@, and the @content_type@ of the part it came from — \"text/plain\"
+for an ordinary mail, \"text/html\" when the message had no plain-text part (@text@ is then markup, tags
+and all), or `null` when it had neither and @text@ is Gmail's short snippet preview."
 data message_body(content_type: string | null, text: string)
 
 @"A read message trimmed to what an assistant needs: the @id@ (the Gmail API message id — addresses
-`read_body` / `modify_labels` / `fetch_attachment`), the @thread_id@ (the conversation it belongs to —
-pass it to `send` to reply inside the same thread), the @message_id@ (the RFC822 `Message-ID` header, e.g.
-\"<abc@mail.gmail.com>\" — DISTINCT from @id@; pass it to `send`'s @in_reply_to@ so a reply threads in
-every mail client), the @sender@ (the raw `From` header), the @subject@ line, the @snippet@ (Gmail's short
-plain-text preview of the message), the @date@ (the raw `Date` header, e.g.
-\"Mon, 21 Jul 2026 09:15:00 +0900\") and the @attachments@ (one `attachment` entry per attached part,
-empty for a mail with none — each entry's @attachment_id@, with this message's @id@, is what
-`fetch_attachment` takes). (The sender field is `sender`, not `from`, because `from` is a reserved word.)"
+`read_body` / `modify_labels` / `fetch_attachment`), the @thread_id@ (pass it to `send` to reply inside
+the same thread), the @message_id@ (the RFC822 `Message-ID` header, distinct from @id@ — pass it to
+`send`'s @in_reply_to@ so a reply threads in every mail client), the @sender@ / @subject@ / @snippet@ /
+@date@ as Gmail reports them, and the @attachments@ (empty for a mail with none). (The sender field is
+`sender`, not `from`, because `from` is a reserved word.)"
 data message(id: string, thread_id: string, message_id: string, sender: string, subject: string, snippet: string, date: string, attachments: array[attachment])
 
 // ── the provider (the credential-name capability) ────────────────────────────
 
-@"Get a usable Google access token, served by `provider` for the extent of a continuation — the capability
-the tools require (`with … credential`). Each ask resolves the provider's named credential through the
-runtime (`oauth.token`): the runtime returns the stored token while its recorded lifetime holds and refreshes
-it against the stored token endpoint once due, so no token bookkeeping lives in the program. The token is a
-`string of private` — it flows only toward a submission sink (the `Bearer` header). A credential that needs a
-human (never authorized, or refresh-dead) never throws: the ask PARKS the run on a `prelude.oauth.authorize`
-escalation and resumes once the browser flow completes. A transient resolution failure throws
-`oauth.server_error` at the provider."
+@"Get a usable Google access token — the capability the tools require (`with … credential`), served by
+`provider`. Each ask resolves the provider's named credential through the runtime (`oauth.token`), which
+owns the stored token and its refresh; the result is a `string of private` and flows only toward the
+`Bearer` header. A credential that needs a human never throws — the ask parks the run on a
+`prelude.oauth.authorize` escalation and resumes once the browser flow completes — while a transient
+resolution failure throws `oauth.server_error` at the provider."
 request credential() -> string of private
 
-// On a downstream 401/403 (an access token revoked BEFORE its stored expiry): there is no invalidation
-// channel here, and none is needed. The runtime keeps serving the stored token while its clock says valid, so
-// a mid-lifetime revocation surfaces as `auth_error` on every call for up to one access-token lifetime (≈ an
-// hour for Google) — the bounded worst case. A converter that turns `auth_error` into `supervise.interrupted`
-// makes the recovery automatic: each re-run asks `credential` afresh, the resolution refreshes once the stored
-// lifetime passes, and a refresh the token endpoint refuses parks the run as a re-authorization prompt.
-@"Provide the Google credential for the extent of the continuation, from @source@ — the
-credentials-unification shape: `use gmail.provider(source = credentials.oauth(name = \"google\"))`
-(the same stored Google credential the `google_calendar` package uses, given a Gmail scope). Resolution
-happens on EVERY `credential` ask (the runtime owns the token material, its cache and its refresh, so this
-provider holds no secret and keeps no state); an unauthorized oauth credential parks the run on a
-`prelude.oauth.authorize` escalation rather than failing, and a transient resolution failure throws at the
-asking call."
+@"Provide the Google credential for the extent of the continuation, from @source@:
+`use gmail.provider(source = credentials.oauth(name = \"google\"))` — the same stored Google credential
+`google_calendar` uses, given a Gmail scope. Resolution happens on every `credential` ask, so this
+provider holds no secret and keeps no state."
 agent provider[R, effect E](
   source: credentials.source,
   continuation: agent (value: null) -> R with {...E, credential},
@@ -141,26 +54,23 @@ agent provider[R, effect E](
 
 @"Issue an authenticated Gmail API call — @method@ to @url@ with @body@ (a value tree, or `null` for a
 call carrying no document) — and return the reply parsed as JSON, or `null` for an empty one. Every
-endpoint in this package goes through here. The `Bearer` header, the 2xx check and the classification are
-`google_common.call`'s; what this adds is the ONE thing that is Gmail's, the `credential` ask, so no call
-site has to spell it. A non-2xx becomes `google_common.classify_api_error(@context@, ...)` (401/403 →
-`http.auth_error`, else `http.api_error`); @context@ names the caller for the message."
+endpoint in this package goes through here: `google_common.call` with this package's `credential` ask
+added. A non-2xx becomes `http.api_failure` (401/403 → `http.auth_error`, else `http.api_error`), with
+@context@ naming the caller."
 agent gmail_call(method: string, url: string, body: unknown | null, context: string) -> unknown {
   google_common.call(method = method, url = url, body = body, context = context, token = credential())
 }
 
 @"Issue an authenticated GET to a Gmail API @url@ and return its parsed JSON body — `gmail_call` with the
-method fixed and no request document, which is every read (`list_recent`, `read_body`, `get_message`, and
-`watch`'s poll)."
+method fixed and no request document, which is every read in this package."
 agent gmail_get(url: string, context: string) -> unknown {
   gmail_call(method = "GET", url = url, body = null, context = context)
 }
 
 // ── response parsing (read out of json) ──────────────────────────────────────
 
-@"The value of the first message header named @name@ (matched case-insensitively) in the @headers@ array of
-`{name, value}` objects, or the empty string when absent. Gmail returns each requested metadata header as
-such an object; this is the total lookup `render_message` reads From / Subject / Date through."
+@"The value of the first @headers@ entry named @name@ (matched case-insensitively), or the empty string
+when absent. Gmail returns each message header as a `{name, value}` object."
 agent header_value(headers: array[unknown], name: string) -> string {
   let lowered = string.to_lower(value = name)
   let matches = array.flatten(target = for (let entry in headers) {
@@ -176,16 +86,12 @@ agent header_value(headers: array[unknown], name: string) -> string {
   }
 }
 
-@"Every attachment Gmail reports under a @payload@, walking `parts` to any depth — a `multipart/mixed`
-message keeps its files next to a nested `multipart/alternative` text, and a forwarded mail nests deeper
-still. The test is the one the API itself makes: a part whose `body.attachmentId` is present is a part
-whose bytes Gmail is holding for a separate fetch, so it is listed, while a part carrying inline
-`body.data` (the text of the mail) is not. Total — a payload with neither an attachment id nor parts
-yields the empty list. Internal to `render_message` and `fetch_attachment`."
+@"Every attachment Gmail reports under a @payload@, walking `parts` to any depth. The test is the API's
+own: a part whose `body.attachmentId` is present has its bytes held for a separate fetch and is listed,
+while a part carrying inline `body.data` is not. A payload with neither an attachment id nor parts yields
+the empty list."
 agent collect_attachments(payload: unknown) -> array[attachment] with pure {
   let body = json.field(target = payload, key = "body")
-  // A size Gmail did not report reads as 0 rather than failing the message: the size only informs a
-  // reader's judgement about whether to fetch, whereas the id is what fetching actually needs.
   let size_bytes = match (json.field(target = body, key = "size")) {
     case integer(bytes) -> bytes
     case _ -> 0
@@ -207,12 +113,9 @@ agent collect_attachments(payload: unknown) -> array[attachment] with pure {
   array.concat(left = own, right = nested)
 }
 
-@"One Gmail message resource as a `message`. The From / Subject / Date / Message-ID come from the
-`payload.headers` array (looked up by name via `header_value`); the id, thread id and snippet come off the
-resource directly; the attachments come from the same payload's part tree (`collect_attachments`), which
-is why `get_message_resource` reads the FULL format. Every read is totalized — a missing header or field
-degrades to the empty string and a missing part tree to no attachments — so a partial resource never
-throws into `watch`'s loop."
+@"One Gmail message resource as a `message`. Every read is totalized — a missing header or field degrades
+to the empty string and a missing part tree to no attachments — so a partial resource never throws into
+`watch`'s loop."
 agent render_message(resource: unknown) -> message {
   let payload = json.field(target = resource, key = "payload")
   let headers = json.items(target = json.field(target = payload, key = "headers"))
@@ -228,48 +131,31 @@ agent render_message(resource: unknown) -> message {
   )
 }
 
-@"Fetch one message's RESOURCE by @id@ — a `messages.get` with `format=full`; the headers
-(From / Subject / Date / Message-ID), the snippet, the `internalDate` and the payload's part tree all ride
-that one reply. The ONE place the per-message endpoint's shape lives, shared by `get_message`, `read_body`,
-`fetch_attachment`'s content-type lookup and `watch` — which needs the same reply's `internalDate` for its
-watermark and so reads the resource rather than the rendered `message`. @context@ names the calling tool
-for a failure's message."
+@"Fetch one message's resource by @id@ — a `messages.get` with `format=full`, so the headers, the snippet,
+the `internalDate` and the payload's part tree all ride one reply. @context@ names the calling tool for a
+failure's message."
 agent get_message_resource(id: string, context: string) -> unknown {
-  // FULL, not `metadata`: the metadata format answers with the message-level fields and the requested
-  // headers and NOTHING of the payload's part tree, and the part tree is the only place an attachment is
-  // described. Read as metadata, every message's `attachments` would come back empty however many files
-  // the mail carried — a quiet lie about the mail rather than an error, which is the failure worth paying
-  // to avoid.
-  //
-  // What that costs is BOUNDED, which matters because `watch` runs this per new message on every poll: a
-  // part's bytes and its `attachmentId` are mutually exclusive in the API's own contract — "when present,
-  // [attachmentId] contains the ID of an external attachment that can be retrieved in a separate
-  // messages.attachments.get request; when not present, the entire content of the message part body is
-  // contained in the data field". So an attachment's bytes NEVER ride this reply; a 10 MB PDF costs its
-  // one part-tree entry per read and nothing more, and only `fetch_attachment` ever moves it. The price
-  // is the message's own TEXT bodies coming along beside the headers — a bigger reply per message, not a
-  // download per poll.
+  // `format=full`, not `metadata`: only the full format carries the payload's part tree, and the part tree
+  // is the only place an attachment is described. The cost stays bounded because Google makes a part's
+  // `data` and its `attachmentId` mutually exclusive, so an attachment's bytes never ride this reply.
   gmail_get(
     url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full",
     context = context,
   )
 }
 
-@"Fetch one message's salient fields by @id@ — `get_message_resource` rendered through `render_message`,
-so a missing header degrades to the empty string rather than throwing. `list_recent`'s per-id read."
+@"Fetch one message's salient fields by @id@ — `get_message_resource` rendered through `render_message`.
+`list_recent`'s per-id read."
 agent get_message(id: string) -> message {
   render_message(resource = get_message_resource(id = id, context = "get_message"))
 }
 
-@"The EPOCH MILLISECONDS of a message resource's `internalDate` — the instant GMAIL received the message —
-or `null` when the field is absent or unreadable. This is the `mark` `watch` hands each `poll.item`: the
-subscription's cursor moves on THIS clock and never on the poller's, so nothing arriving between a tick's
-listing and its deliveries can be stepped over. Milliseconds, not seconds, because that is `poll`'s unit
-for every mark; the second-granular conversion happens once, where the `after:` term is built."
+@"The epoch milliseconds of a message resource's `internalDate` — the instant Gmail received the message —
+or `null` when the field is absent or unreadable. This is the `mark` `watch` hands each `poll.item`, so
+the subscription's cursor moves on Gmail's clock and never on the poller's."
 agent internal_date_milliseconds(resource: unknown) -> number | null {
-  // Google renders int64 fields as JSON STRINGS, so `internalDate` arrives as "1753500000000" — but the
-  // bare-number shape is read too, because a cursor that silently stopped advancing on a shape change would
-  // turn the watch mute rather than loud, the hardest failure to notice.
+  // Google renders int64 fields as JSON strings, so `internalDate` arrives as "1753500000000"; the bare
+  // number is read too, since a cursor that silently stopped advancing would turn the watch mute.
   match (json.field(target = resource, key = "internalDate")) {
     case string(text) -> string.to_integer(value = text)
     case integer(value) -> value
@@ -277,80 +163,59 @@ agent internal_date_milliseconds(resource: unknown) -> number | null {
   }
 }
 
-@"Percent-encode a Gmail search @value@ for the `q` URL parameter — a full component encoder
-(`string.url_encode`), so a quoted phrase, an `&`, or any reserved character in the query rides
-intact, not just spaces."
-agent encode_query(value: string) -> string {
-  string.url_encode(value = value)
+@"The `messages.list` URL for a Gmail search @query@ asking for at most @max_results@ ids — the first
+page, which `google_common.paged` continues with `&pageToken=`. The query rides through
+`string.url_encode`, so a quoted phrase, an `&` or any other reserved character arrives intact."
+agent list_url(query: string, max_results: integer) -> string {
+  f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${string.url_encode(value = query)}&maxResults=${string.to_string(value = max_results)}"
 }
 
-@"The `messages.list` URL for a Gmail search @query@ asking for at most @max_results@ ids, continuing from
-@page_token@ when one is given (`null` asks for the first page). The one place the search endpoint's shape
-lives, shared by `list_recent`'s single page and `watch`'s full drain."
-agent list_url(query: string, max_results: integer, page_token: string | null) -> string {
-  let base = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encode_query(value = query)}&maxResults=${string.to_string(value = max_results)}"
-  match (page_token) {
-    case null -> base
-    case token -> base ++ "&pageToken=" ++ token
-  }
-}
-
-@"The message ids on one `messages.list` page, in the order Gmail returned them (newest first) — the reply
-carries only `{id, threadId}` per hit, so the salient fields need a `get_message` each. A page without the
-`messages` array (no match) degrades to the empty list."
-agent page_message_ids(parsed: unknown) -> array[string] {
-  for (let item in json.items(target = json.field(target = parsed, key = "messages"))) {
-    next json.text(target = json.field(target = item, key = "id"))
+@"The message ids of the `messages.list` @hits@, in the order Gmail returned them (newest first) — a hit
+carries only `{id, threadId}`, so the salient fields need a `get_message` each."
+agent message_ids(hits: array[unknown]) -> array[string] {
+  for (let hit in hits) {
+    next json.text(target = json.field(target = hit, key = "id"))
   }
 }
 
 @"List the ids of the messages matching a Gmail search @query@, newest first, at most @max_results@ — one
-`messages.list` page. `list_recent`'s listing; `watch` drains every page instead, because a cursor may only
-pass mail that has actually been seen."
+`messages.list` page. A reply without the `messages` array (no match) degrades to the empty list."
 agent list_message_ids(query: string, max_results: integer) -> array[string] {
-  page_message_ids(parsed = gmail_get(
-    url = list_url(query = query, max_results = max_results, page_token = null),
+  let parsed = gmail_get(
+    url = list_url(query = query, max_results = max_results),
     context = "list_message_ids",
-  ))
+  )
+  message_ids(hits = json.items(target = json.field(target = parsed, key = "messages")))
 }
 
 // ── the tools ────────────────────────────────────────────────────────────────
 
 @"Tool: list the most recent messages matching a Gmail search @query@ — the same query language as the
 Gmail search box (\"is:unread\", \"from:alice@example.com newer_than:2d\", \"subject:invoice\") — newest
-first, at most @max_results@. Each result is trimmed to id / thread / sender / subject / snippet / date, small
-enough to feed straight back to the model, and its @id@ addresses `read_body` and `modify_labels`. A message
-resource is fetched per id for its headers, so a large @max_results@ is a proportional number of calls."
+first, at most @max_results@. Each result is trimmed to id / thread / sender / subject / snippet / date,
+and its @id@ addresses `read_body`, `modify_labels` and `fetch_attachment`. One message resource is
+fetched per id, so a large @max_results@ costs a proportional number of calls."
 agent list_recent(query: string, max_results: integer ?= 10) -> array[message] {
   for (let id in list_message_ids(query = query, max_results = max_results)) {
     next get_message(id = id)
   }
 }
 
-@"Tool: read a message's body by @id@. Returns the body as a `message_body` — the @text@ and the
-@content_type@ of the part it came from — so a reader always knows WHAT it is holding. The preference is
-`text/plain` (the `payload.body.data`, or for a `multipart/*` message the first `text/plain` descendant's,
-base64url-decoded to real text); a message with no plain-text part anywhere — an HTML-only mail, which a
-newsletter, a receipt and most mail a company sends all are — comes back with @content_type@
-\"text/html\" and its MARKUP as the text, because that markup is the whole substance of such a mail and
-reads perfectly well, whereas nothing at all would report a full message as blank. Expect tags in that
-case, and expect a long HTML mail to be a long result. A message with neither part comes back with
-@content_type@ `null` and Gmail's SNIPPET — the short plain-text preview the API carries on every
-resource — so the read is never empty-handed. ATTACHMENTS are not part of the body: they are listed on the
-`message` (`list_recent`) and fetched by `fetch_attachment`."
+@"Tool: read a message's body by @id@. Returns a `message_body` — the @text@ and the @content_type@ of the
+part it came from, so a reader always knows what it is holding: \"text/plain\" for an ordinary mail,
+\"text/html\" with the raw markup when the message has no plain-text part (a newsletter, a receipt and
+most mail a company sends; expect tags, and expect a long mail to be a long result), or `null` with
+Gmail's short snippet preview when it has neither. Attachments are not part of the body — they are listed
+on the `message` (`list_recent`) and fetched by `fetch_attachment`."
 agent read_body(id: string) -> message_body {
   let resource = get_message_resource(id = id, context = "read_body")
   let payload = json.field(target = resource, key = "payload")
   let plain = decode_part_text(payload = payload, mime_type = "text/plain")
-  if (string.is_blank(value = plain)) {
+  // Blank, not merely empty: a `text/plain` part holding a newline and two spaces is a mail with no text
+  // in it, while its HTML part may carry the whole substance.
+  if (string.trim(value = plain) == "") {
     let markup = decode_part_text(payload = payload, mime_type = "text/html")
-    // WHY the markup rather than the snippet: an HTML-only mail keeps its entire content in the
-    // `text/html` part, and a model reads HTML as well as it reads prose — so answering "what did that
-    // newsletter say" with two lines of preview, or with nothing, is wrong in the quiet way that looks
-    // like an empty mail. What makes the fallback visible is the content type RIDING ALONGSIDE the text:
-    // the caller dispatches on data it was handed, instead of on an announcement this package would
-    // otherwise have written into the prose for it.
-    if (string.is_blank(value = markup)) {
+    if (string.trim(value = markup) == "") {
       message_body(content_type = null, text = json.text(target = json.field(target = resource, key = "snippet")))
     } else {
       message_body(content_type = "text/html", text = markup)
@@ -360,23 +225,20 @@ agent read_body(id: string) -> message_body {
   }
 }
 
-@"The decoded text of the first @mime_type@ part under a Gmail @payload@ — its `body.data` (base64url)
-decoded when the payload IS that type, otherwise the first such descendant found by walking `parts` (a
-`multipart/*` message). The wanted type is an ARGUMENT rather than a second walk, so the preference order
-lives in one place (`read_body`: plain, then html) and this stays a plain search. Total: no such part
-anywhere returns the empty string. Internal to `read_body`."
+@"The decoded text of the first @mime_type@ part under a Gmail @payload@ — its base64url `body.data`
+decoded when the payload is that type, otherwise the first such descendant found by walking `parts`. No
+such part anywhere returns the empty string. Internal to `read_body`, which fixes the preference order."
 agent decode_part_text(payload: unknown, mime_type: string) -> string with pure {
   match (json.field(target = payload, key = "mimeType")) {
     case string(part_mime_type) -> {
       if (part_mime_type == mime_type) {
         string.from_base64url(value = json.text(target = json.field(target = json.field(target = payload, key = "body"), key = "data")))
       } else {
-        // A multipart (or any container) message: walk the parts and take the first body of the wanted type.
         let found = for (let part in json.items(target = json.field(target = payload, key = "parts"))) {
           next decode_part_text(payload = part, mime_type = mime_type)
         }
         let non_empty = array.flatten(target = for (let text in found) {
-          next if (string.is_blank(value = text)) { [] } else { [text] }
+          next if (string.trim(value = text) == "") { [] } else { [text] }
         })
         match (array.get(target = non_empty, index = 0)) {
           case null -> ""
@@ -388,23 +250,19 @@ agent decode_part_text(payload: unknown, mime_type: string) -> string with pure 
   }
 }
 
-@"Translate a base64url payload (the `-_` alphabet, padding often omitted) into the STANDARD base64
-(`+/`, padded to a multiple of four) that `files.from_base64` takes. Gmail hands back every `data` field in
-the url alphabet, while the blob producer validates the standard one strictly and refuses anything else
-with `files.malformed_base64`, so this translation is what lets an attachment's bytes land intact instead
-of being rejected. It is deliberately NOT `string.from_base64url`: that decodes to TEXT, and decoding a
-PDF's or an image's bytes as UTF-8 mangles them in a way nothing downstream can detect — the silent
-corruption this exists to avoid. Internal to `fetch_attachment`."
+@"Translate a base64url payload (the `-_` alphabet, padding often omitted) into the standard base64
+`files.from_base64` accepts, which validates its alphabet strictly. Deliberately not
+`string.from_base64url`: that decodes to text, and decoding a PDF's or an image's bytes as UTF-8 mangles
+them undetectably. Internal to `fetch_attachment`."
 agent base64url_to_base64(value: string) -> string with pure {
   let translated = string.replace(
     value = string.replace(value = value, search = "-", replacement = "+"),
     search = "_",
     replacement = "/",
   )
-  // Restore the `=` padding base64url drops, because the strict decoder requires a length that is a
-  // multiple of four. A remainder of 1 is not a base64 length at all (a truncated payload) and is left
-  // alone on purpose: it then reaches the decoder and fails loudly as `files.malformed_base64` rather than
-  // being padded into some other, wrong set of bytes.
+  // Restore the `=` padding base64url drops; the strict decoder requires a length that is a multiple of
+  // four. A remainder of 1 is not a base64 length at all, so it is left to fail loudly at the decoder
+  // rather than being padded into some other, wrong set of bytes.
   match (string.length(value = translated) % 4) {
     case 2 -> translated ++ "=="
     case 3 -> translated ++ "="
@@ -412,12 +270,10 @@ agent base64url_to_base64(value: string) -> string with pure {
   }
 }
 
-@"The content type the MESSAGE declares for the attachment @attachment_id@ names on message @id@, or \"\"
-when that message reports no such attachment. The `attachments.get` reply carries the bytes and a size and
-no MIME type at all, and a `file` recording no type cannot be SHOWN to a model as an image (an image is
-inlined on its recorded `image/*` type), so `fetch_attachment` spends one message read to record the type
-the mail itself declared. The lookup runs over the same `attachment` list a `message` carries — data
-already derived, not a second parse of the payload. Internal to `fetch_attachment`."
+@"The content type the message declares for the attachment @attachment_id@ names on message @id@, or \"\"
+when that message reports no such attachment. The `attachments.get` reply carries no MIME type at all, and
+a `file` recording none cannot be shown to a model as an image, so `fetch_attachment` spends one message
+read to recover it. Internal to `fetch_attachment`."
 agent attachment_content_type(id: string, attachment_id: string) -> string {
   let payload = json.field(target = get_message_resource(id = id, context = "fetch_attachment"), key = "payload")
   let declared = array.flatten(target = for (let entry in collect_attachments(payload = payload)) {
@@ -429,23 +285,18 @@ agent attachment_content_type(id: string, attachment_id: string) -> string {
   }
 }
 
-@"Tool: fetch ONE of a message's attachments and return it as a file. @id@ is the MESSAGE's id (a
-`list_recent` result's @id@ — not its @message_id@) and @attachment_id@ is the @attachment_id@ of one entry
-in that message's @attachments@ list. PASS @content_type@ TOO — the very `content_type` that listing showed
-beside the attachment_id. Gmail regenerates attachment ids on every message read, so when this agent has to
-re-read the message to look the type up itself, the id you hold may no longer match any part and the file
-comes back UNTYPED — a receiver then sees a generic `.bin` it cannot preview. The listing in your hands is
-the reliable source; the re-read is only the fallback when you omit it. The result is a `file` handle: the
-bytes stay runtime-side, so the handle can be passed straight on to any other tool you hold that takes a
-file — a viewer to LOOK at it, or an outbound tool's files to send it onward — while the payload itself
-never enters the conversation. (The file carries a TYPE but no NAME yet, so a receiver sees a generated
-name like `file-1.pdf`; say the real filename in your message when it matters.) This only READS: nothing in
-the mailbox changes, and one call fetches one attachment, so ask for the one you actually need. A payload
-that comes back corrupt throws `files.malformed_base64` rather than handing back broken bytes; a non-2xx
-reply raises `http.api_failure` (`http.auth_error` | `http.api_error`)."
+@"Tool: fetch one of a message's attachments and return it as a file. @id@ is the message's id (a
+`list_recent` result's @id@, not its @message_id@) and @attachment_id@ is the @attachment_id@ of one entry
+in that message's @attachments@ list. Pass @content_type@ too — the very `content_type` that listing
+showed beside the attachment id: Gmail regenerates attachment ids on every message read, so the fallback
+re-read may match no part and hand back an untyped file a receiver sees as a generic `.bin`. The result is
+a `file` handle whose bytes stay runtime-side, so it can be passed straight to any other tool you hold
+that takes a file while the payload never enters the conversation. The file carries a type but no name, so
+a receiver sees a generated one like `file-1.pdf` — say the real filename in your message when it matters.
+This only reads, and one call fetches one attachment, so ask for the one you actually need. A payload that
+comes back corrupt throws `files.malformed_base64`; a non-2xx reply raises `http.api_failure`
+(`http.auth_error` | `http.api_error`)."
 agent fetch_attachment(id: string, attachment_id: string, @"The content type the listing declared for this attachment; omit to make this agent re-read the message and look it up (unreliable — see above)." content_type: string | null ?= null) -> file {
-  // The caller's declared type first — the listing it read is the same data the lookup would derive,
-  // minus the id-stability hazard; the message re-read is the fallback, not the norm.
   let content_type = match (content_type) {
     case null -> attachment_content_type(id = id, attachment_id = attachment_id)
     case declared -> declared
@@ -454,9 +305,8 @@ agent fetch_attachment(id: string, attachment_id: string, @"The content type the
     url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}/attachments/${attachment_id}",
     context = "fetch_attachment",
   )
-  // `files.from_base64` PRODUCES a blob: the bytes go to the project's blob store and the value plane
-  // carries the slim handle alone, so a 5 MB attachment never rides a durable call record, a trace or a
-  // model's context. That is the whole reason a `file` — not a base64 string — is the right return here.
+  // `files.from_base64` produces a blob: the bytes go to the project's blob store and the value plane
+  // carries the slim handle alone, so an attachment never rides a durable call record or a trace.
   files.from_base64(
     content = base64url_to_base64(value = json.text(target = json.field(target = resource, key = "data"))),
     content_type = content_type,
@@ -464,13 +314,13 @@ agent fetch_attachment(id: string, attachment_id: string, @"The content type the
 }
 
 @"Tool: send a plain-text email from the authenticated user. @to@ is the recipient address, @subject@ the
-subject line, @body@ the message body. Returns the sent message's id. To REPLY inside a conversation, pass
-@thread_id@ (a message's `thread_id`, so Gmail files the reply in that thread) and @in_reply_to@ (the
-message's `message_id` — its RFC822 `Message-ID` header, read from `list_recent`); both default to `null`,
-which is a fresh send. When @in_reply_to@ is given it becomes the reply's `In-Reply-To` and `References`
-headers, so a mail client threads it too. (Compose the @subject@ yourself — prefix \"Re: \" for a reply.)
-The RFC822 message is base64url-encoded into the ordinary `messages.send` `raw` field. Raises
-`http.api_failure` (`http.auth_error` | `http.api_error`) on a non-2xx reply."
+subject line, @body@ the message body; it returns the sent message's id, and a sent mail cannot be taken
+back. To reply inside a conversation, pass @thread_id@ (a message's `thread_id`, so Gmail files the reply
+in that thread) and @in_reply_to@ (that message's `message_id` — its RFC822 `Message-ID` header, not its
+`id`), which become the `In-Reply-To` and `References` headers so a mail client threads it too; both
+default to `null`, a fresh send. Compose the @subject@ yourself — prefix \"Re: \" for a reply. The RFC822
+message is base64url-encoded into the ordinary `messages.send` `raw` field; a non-2xx reply raises
+`http.api_failure` (`http.auth_error` | `http.api_error`)."
 agent send(
   to: string,
   subject: string,
@@ -478,21 +328,15 @@ agent send(
   thread_id: string | null ?= null,
   in_reply_to: string | null ?= null,
 ) -> string {
-  // A reply carries `In-Reply-To` / `References` naming the parent's RFC822 Message-ID, so a mail client
-  // threads it (Gmail also threads server-side via `threadId` below). An absent `in_reply_to` (a fresh
-  // send) adds no such headers. Since the parent's own References chain is not exposed, `References` is
-  // just the parent — RFC 5322's accepted fallback when the ancestor chain is unknown.
+  // The parent's own References chain is not exposed, so `References` is just the parent — RFC 5322's
+  // accepted fallback when the ancestor chain is unknown.
   let reply_headers = match (in_reply_to) {
     case null -> ""
     case parent -> f"In-Reply-To: ${parent}\r\nReferences: ${parent}\r\n"
   }
-  // An RFC 5322 message: the To / Subject (and any reply) headers, a blank line, then the body. CRLF
-  // separates header lines and the header/body boundary, as the mail format requires.
   let raw = f"To: ${to}\r\nSubject: ${subject}\r\n${reply_headers}\r\n${body}"
-  // The ordinary `messages.send` with the message base64url-encoded in the `raw` field — the standard
-  // path, now that `string.to_base64url` exists. `threadId` files the message in an existing conversation;
-  // omitted (`thread_id` absent) it starts a new one, so an omitted arg is a smaller request rather than a
-  // blank field — which is what `record.set_if` says in one line.
+  // An absent `threadId` starts a new conversation, so an omitted argument is a smaller request rather
+  // than a blank field.
   let payload = record.set_if[unknown](
     target = { raw = string.to_base64url(value = raw) },
     key = "threadId",
@@ -509,14 +353,12 @@ agent send(
   ))
 }
 
-@"Tool: change a message's labels — add the label ids in @add@, remove those in @remove@. The common use is
-marking a message read by removing \"UNREAD\", or filing it by adding a label id. Both lists default to empty
-(an empty call is a no-op at the API). @id@ is the message id. Returns null; raises `http.api_failure`
-(`http.auth_error` | `http.api_error`) on a non-2xx reply."
+@"Tool: change the labels on message @id@ — add the label ids in @add@, remove those in @remove@. The
+common use is marking a message read by removing \"UNREAD\", or filing it by adding a label id. Both lists
+default to empty (an empty call is a no-op at the API), and the call returns null; a non-2xx reply raises
+`http.api_failure` (`http.auth_error` | `http.api_error`)."
 agent modify_labels(id: string, add: array[string] ?= [], remove: array[string] ?= []) -> null {
   let payload: record[unknown] = { addLabelIds = add, removeLabelIds = remove }
-  // The reply is the modified message resource, which this tool does not report: the caller asked for a
-  // label change and gets the fact that it happened.
   let _ = gmail_call(
     method = "POST",
     url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}/modify",
@@ -528,92 +370,59 @@ agent modify_labels(id: string, add: array[string] ?= [], remove: array[string] 
 
 // ── the watch daemon ─────────────────────────────────────────────────────────
 
-@"Every message id matching @query@, across ALL result pages, OLDEST FIRST — `watch`'s per-poll listing.
-@page_token@ is `null` for the first page and @accumulated@ the ids gathered so far. Draining every page
-is what `poll.subscribe` requires of a `fetch` and what makes its cursor safe: Gmail lists matches NEWEST
-first and offers no ascending order, so a listing cut off at a cap would hand back the newest matches only,
-and a cursor advanced over them would strand the older ones below it forever. The recursion depth is the
-number of pages in ONE poll (500 matches a page — a poll's arrivals, not the mailbox), not the daemon's
-lifetime, so it does not accumulate like a per-tick loop would. Internal to `watch`."
-agent list_all_message_ids(query: string, page_token: string | null, accumulated: array[string]) -> array[string] with credential | io | prelude.throw[http.api_failure | http.fetch_error | json.parse_error] {
-  let parsed = gmail_get(url = list_url(query = query, max_results = 500, page_token = page_token), context = "watch")
-  let combined = array.concat(left = accumulated, right = page_message_ids(parsed = parsed))
-  match (json.field(target = parsed, key = "nextPageToken")) {
-    case string(token) -> list_all_message_ids(query = query, page_token = token, accumulated = combined)
-    // The pages arrive newest-first, and `poll.subscribe` delivers in the order this list is returned:
-    // OLDEST FIRST is what lets the cursor only ever pass mail that has actually been delivered, so a
-    // `deliver_to` that throws mid-tick leaves the rest of the tick still ABOVE the cursor.
-    case _ -> array.reverse(target = combined)
-  }
+@"Every message id matching @query@, across all result pages, oldest first — `watch`'s per-poll listing.
+Gmail lists matches newest first and offers no ascending order, so the full drain is reversed: a
+`poll.subscribe` cursor may only pass mail that has actually been delivered, and a listing cut off at a
+cap would strand everything below it forever. Internal to `watch`."
+agent list_all_message_ids(query: string) -> array[string] {
+  let hits = google_common.paged(
+    base_url = list_url(query = query, max_results = 500),
+    item_key = "messages",
+    context = "watch",
+    token = credential(),
+  )
+  array.reverse(target = message_ids(hits = hits))
 }
 
-@"Watch the mailbox for mail that ARRIVES matching a Gmail search @query@ and deliver each new message
+@"Watch the mailbox for mail that arrives matching a Gmail search @query@ and deliver each new message
 once, oldest first, to @deliver_to@ — `poll.subscribe` under a Gmail adapter, so it composes under
-`parallel [ … ]` beside any other daemon and never resolves (`-> never`). Every
-@poll_interval_milliseconds@ it searches `<@query@> after:<cursor>` (@query@ is the ordinary Gmail search
-language — \"is:unread\", \"from:alice@example.com\"), hands each unseen message to @deliver_to@, and moves
-the cursor to that message's own arrival instant (Gmail's `internalDate`, never the poller's clock).
-@deliver_to@'s effects @E@ flow to the caller's handlers unchanged, so a delivery may itself call other
-tools (reply, label).
+`parallel [ … ]` and never resolves (`-> never`). Every @poll_interval_milliseconds@ it searches
+`<@query@> after:<cursor>`, hands each unseen message to @deliver_to@, and moves the cursor to that
+message's own arrival instant (Gmail's `internalDate`, never the poller's clock). @deliver_to@'s effects
+@E@ flow to the caller's handlers unchanged, so a delivery may itself reply or label.
 
-DELIVERY IS AT-LEAST-ONCE — `poll.subscribe`'s contract, in its words. A message reaches @deliver_to@ one
-or more times, never zero: the commit lands only after a delivery returns, so a crash or a throw in between
-re-delivers exactly that message on the next tick. EXACTLY-ONCE IS BUILT AT THE DESTINATION, by making the
-delivery idempotent — key it on the `message`'s @id@, which is the identity this subscription already
-promises is stable — never by expecting the loop to be stronger than the mailbox allows.
+Delivery is at-least-once: the commit lands only after a delivery returns, so a crash or a throw in
+between re-delivers exactly that message on the next tick. Build exactly-once at the destination by making
+the delivery idempotent on the `message`'s @id@.
 
-@cursor_at@ DECIDES WHAT A RESTART DOES, and it is the consequential choice here. `poll.resume(key = ...)`
-keeps the cursor in the store, so a runtime restart, a re-forked fiber and a `replay` re-run all resume
-from it and the mail that arrived while the watch was DOWN is delivered, oldest first, on the tick after it
-comes back. `poll.fresh()` keeps the cursor in the run alone: every fresh activation re-primes at that
-moment and the downtime is skipped for good, silently. There is no default — a watch that will be re-forked
-(a persisted monitor, anything under `replay`) wants `resume` with a key of its own, and a second watch
-sharing one key overwrites the first's cursor.
+@cursor_at@ decides what a restart does and has no default. `poll.resume(key = ...)` keeps the cursor in
+the store, so the mail that arrived while the watch was down is delivered, oldest first, on the tick after
+it comes back; `poll.fresh()` re-primes on every activation and skips the downtime for good. Two watches
+sharing one key overwrite each other's cursor.
 
-WHAT IT REPORTS IS ARRIVAL, NOT MATCHING. The mail already in the mailbox when the subscription first
-starts is never delivered, however well it matches: a watch started on \"is:unread\" over 200 unread
-messages stays silent until the next mail arrives. By the same token, mail that comes to match @query@
-LATER — an old message you star, label or mark unread — is not delivered either, because the search never
-looks below the cursor. This is the right shape for hearing about incoming mail, and the wrong one for a
-general \"tell me whenever anything matches this search\" trigger; `list_recent` answers the latter. (The
-`after:` boundary's granularity is one second, and the subscription re-lists a second's worth below its
-cursor on every tick — so a message at the cursor's own second is listed again and deduplicated by its id,
-not delivered twice.)
+What it reports is arrival, not matching: the mail already in the mailbox when the subscription starts is
+never delivered, and mail that comes to match @query@ later — an old message you star or mark unread — is
+not either, because the search never looks below the cursor. `list_recent` answers that question instead.
 
-No retry is built in — a poll failure (an http error, a rejected token, a @deliver_to@ that throws)
-propagates and kills the subscription, exactly as an uncaught failure in any callee does. Compose
-resilience by wrapping the watch in a supervise provider (`supervise.forever` with a converter that replays the
-transient blips AND `http.auth_error` — the re-run re-resolves the token, and a credential needing a human
-parks on the runtime's authorize escalation rather than failing). With @cursor_at@ = `poll.resume(...)` the
-backoff costs nothing but latency: the cursor outlives the failed activation, so the mail that arrived
-during it is delivered once the watch is back. The first poll is one @poll_interval_milliseconds@ in (a
-`time.watch` occurrence fires one interval after the start), so a message arriving just after the watch
-starts waits up to one interval — it is not lost, only pending."
+No retry is built in — a poll failure propagates and kills the subscription — so compose resilience by
+wrapping the watch in a supervise provider. The first poll is one @poll_interval_milliseconds@ in, so a
+message arriving just after the watch starts is pending rather than lost."
 agent watch[effect E](
   @"The Gmail search to watch, in the ordinary search-box language." query: string,
   @"How often to poll, in milliseconds." poll_interval_milliseconds: number,
   @"Where the cursor lives between activations: `poll.resume(key = ...)` to deliver the downtime after a restart, `poll.fresh()` to skip it." cursor_at: poll.continuity,
   @"Called once per newly arrived message; its effects flow to the caller's handlers unchanged." deliver_to: agent (value: message) -> null with E,
 ) -> never with E | io | credential | store.get | store.set | prelude.throw[http.api_failure | http.fetch_error | json.parse_error] {
-  // THE WHOLE ADAPTER, and all this package still owns of the loop: one listing, one item per message.
   // A local agent because it captures @query@; its `credential` and throws flow out to the caller.
   agent fetch(since: number, tick: number) -> array[poll.item[message]] with credential | io | prelude.throw[http.api_failure | http.fetch_error | json.parse_error] {
-    // Gmail's `after:` takes whole SECONDS, so the millisecond floor converts HERE — the one place the two
-    // clocks meet. The `poll.watermark(overlap = 1000)` below is what makes the conversion safe in both
-    // directions: whether Gmail reads `after:` as `>` or as `>=` (it does not document which), the second
-    // the cursor sits in is re-listed, and its ids are exactly the ones the memory still remembers.
+    // Gmail's `after:` takes whole seconds, so the millisecond cursor floors here — the one place the two
+    // clocks meet. The 1000 ms overlap below covers the conversion whichever way Gmail reads `after:` (it
+    // does not document whether the boundary is inclusive).
     let arrivals = f"${query} after:${string.to_string(value = math.floor(value = since / 1000))}"
-    // The caller's query AND the floor: Gmail ANDs the terms, so the search sees only mail that arrived
-    // past it. A caller's own `after:` / `newer_than:` term simply narrows it further.
-    for (let id in list_all_message_ids(query = arrivals, page_token = null, accumulated = [])) {
-      // One resource read per LISTED message, which the overlap keeps to the arrivals plus whatever sits
-      // in the cursor's own second — normally nothing. The full resource is what carries both the
-      // `internalDate` this item's mark needs and the fields `render_message` renders, so it is one read,
-      // not two.
+    for (let id in list_all_message_ids(query = arrivals)) {
       let resource = get_message_resource(id = id, context = "watch")
-      // An unreadable `internalDate` is read AS THE TICK: the item is still committed (so it is not
-      // delivered again) while the cursor cannot travel past this tick anyway (so no other mail is stepped
-      // over) — the two failure modes that reading it as 0, or as "now", would each cause.
+      // An unreadable `internalDate` is read as the tick: the item is still committed, while the cursor
+      // cannot travel past this tick anyway, so no other mail is stepped over.
       let mark = match (internal_date_milliseconds(resource = resource)) {
         case null -> tick
         case parsed -> parsed
@@ -623,12 +432,9 @@ agent watch[effect E](
   }
   poll.subscribe[message](
     schedule = time.interval(milliseconds = poll_interval_milliseconds),
-    // Gmail has a monotone receive clock and lists from an instant, so the memory is a FLOOR plus the ids
-    // at or above it — constant-size however long the watch runs. The 1000 ms overlap is the slack that
-    // covers `after:`'s whole-second, undocumented-inclusivity boundary; it costs no duplicates.
+    // Gmail has a monotone receive clock, so the memory is a floor plus the ids at or above it —
+    // constant-size however long the watch runs.
     dedup = poll.watermark(overlap = 1000),
-    // Arrivals, not matches: the mailbox as it stands when the watch starts is below the cursor and is
-    // never listed.
     backlog = poll.skip_backlog(),
     continuity = cursor_at,
     fetch = fetch,
